@@ -55,6 +55,40 @@ The Bonsol callback reaches the program only through the raw `fallback` instruct
 
 `open_job` accepts an `aggregate-proof` job only with the Bonsol aggregate capability hash, and accepts that capability hash only on an `aggregate-proof` job. The marker gate needs both, so a job with one of them could never settle.
 
+## What Is Proven, And What Is Not
+
+Two things carry a zero-knowledge proof, and the language model step is not one of them.
+
+**Proven, gated on chain.** The aggregate reduction. A Bonsol node proves the reducer
+guest ran over the committed artifact, the Solana program records the marker, and
+`settle_aggregate_proof_job` refuses to pay without it.
+
+**Proven, verified off chain.** The branch canonicalization receipt. A branch worker
+proves that the output document it published encodes to exactly the receipt whose hash
+the chain accepted, and the verifier checks that proof before it attests. It is not an
+on-chain gate, and nothing downstream turns it into one. `settle_job` pays a `Completed`
+branch at its challenge deadline without reading an attestation or a receipt
+(`solana/programs/kswarm_protocol/src/lib.rs:563-609`), the aggregate guest is handed
+branch receipt bytes and no branch attestation, and `settle_aggregate_proof_job` checks
+the aggregate job's own attestation and marker, not the branches'. What the receipt does
+buy is real: a disagreeing attestation is challengeable and slashable inside the window.
+The branch-level guarantee is therefore economic and social rather than enforced by the
+chain; the aggregate-level one is enforced. See [Proof Layer Status](proof-layer-status.md),
+"What the chain enforces about a branch", for the full position and the open item.
+
+**Not proven: the branch language model step.** No zero-knowledge proof says a language
+model produced a particular forecast from a particular prompt, and no 2026 technology can
+produce one for a model this size. The largest language model anyone can prove with
+released code is GPT-2 small at 124M parameters, the fastest published figure for it is
+at a 16-token sequence, and kswarm's branch model is roughly 25 times larger. Every
+prover that can reach even that size is licensed for evaluation only and tied to the
+vendor's own proving network, so none of them could be shipped in a worker image in any
+case. That step is secured **economically**: a verifier re-executes the branch with the
+identical model, seed and configuration, and a worker whose receipt disagrees is
+challenged and slashed. That guarantee rests on determinism measured on one model and one
+prompt family; see [LLM Bridge Honest Limits](llm-bridge-honest-limits.md). Layouts and
+the full position are in [Proof Layer Status](proof-layer-status.md).
+
 ## Challenge Authorization
 
 A challenge can slash a worker, so it is not permissionless. `challenge_job` accepts only the verifier that the customer or the protocol admin assigned to the job with `assign_verifier`. This holds for every job class. A worker can never challenge its own job. Any verifier with the floor stake may still post an attestation, but an attestation moves no funds by itself: on a non-aggregate job it does not block `settle_job`, and on an aggregate job settlement needs a matching attestation plus the Bonsol marker.

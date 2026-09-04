@@ -105,7 +105,6 @@ The current swarm implementation is intentionally minimal:
 Proof relationships are split by layer:
 
 - Solana: escrow, stake, claim, settle, refund, slash
-- `EZKL`: proof-carrying small ONNX inference inside branch workers
 - `zkVM`: proof-carrying deterministic reducers and aggregate logic
 - `Bonsol`: native Solana evaluation path for the deterministic `zkVM` lane
 - trust-by-verify: full higher-level AI simulation behavior outside the deterministic proof boundary
@@ -114,11 +113,11 @@ Proof relationships are split by layer:
 
 The full statement is in [docs/proof-layer-status.md](./proof-layer-status.md). In short:
 
-- The zkVM guests commit the statistics the caller supplies. They hash `line_count`, `word_count`, and `score_hex` and commit the hash. They do not read the source text and do not recompute the counts. The reducer recompute is future work.
-- The aggregate settlement is proof-gated on-chain. `settle_aggregate_proof_job` pays only when the Bonsol callback marker is `Verified` and the verifier attestation matches the worker result.
-- The per-branch `EZKL` proof and `zkVM` receipt are verified off-chain by the swarm runner. Since PR `fix/proof-binding` they are bound to the claimed result: the EZKL public instances must equal the claimed counts and score, and every zkVM journal field must equal the manifest. A mismatch rejects the branch output.
-- The per-branch proofs have no on-chain gate. `submit_receipt` stores the result hash only.
-- The `EZKL` model is a fixed linear placeholder (`2 * line_count + 3 * word_count + 1`), not an ML submodel.
+- The aggregate settlement is proof-gated on-chain. `settle_aggregate_proof_job` pays only when the Bonsol callback marker is `Verified` and the verifier attestation matches the worker result. The aggregate guest recomputes: it rehashes each branch receipt, decodes the branch values out of those bytes, and applies the combiner itself.
+- The branch canonicalization guest also recomputes. It is handed the branch output document and derives the `MFB2` receipt from it, so a worker cannot publish one document and settle another. The verifier checks that receipt off-chain before it attests, and a verifier configured to require one will not attest without it.
+- The legacy branch reducer (`protocol/bonsol-branch-reducer`) still commits the statistics its caller supplies. It is off the aggregate path and is kept only to drive the Bonsol callback and marker-PDA smoke tests.
+- The per-branch receipt has no on-chain gate of its own, and nothing downstream supplies one. `submit_receipt` stores the result hash only, and `settle_job` pays a `Completed` branch at its challenge deadline without reading an attestation or a receipt (`solana/programs/kswarm_protocol/src/lib.rs:563-609`). The aggregate guest is handed branch receipt bytes and no branch attestation, and `settle_aggregate_proof_job` checks the aggregate job's own attestation and marker, not the branches'. The receipt gates the attestation, and a disagreeing attestation is challengeable and slashable, so the branch-level guarantee is economic and social; the aggregate-level one is enforced by the program. See [docs/proof-layer-status.md](./proof-layer-status.md), "What the chain enforces about a branch".
+- **There is no per-branch proof of a model.** The two-feature linear placeholder that used to carry that name was removed on 2026-09-04. The branch language model step is not proven and no 2026 technology proves it; it is secured by verifier re-execution and slashing. See [docs/proof-layer-status.md](./proof-layer-status.md).
 - The off-chain `zkvm-reducer` and the on-chain Bonsol guest both pin risc0 `3.0.3`. The two lanes still do not share receipts. Stable risc0 is 3.0.6; a bump must move the Bonsol prover and the on-chain verifier selector together (see `docs/proof-layer-status.md`).
 
 ## Files To Know

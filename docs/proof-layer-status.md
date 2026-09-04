@@ -1,6 +1,8 @@
 # Proof Layer Status
 
-Last verified: 2026-09-04 (PR `feat/proof-path-python`).
+Last verified: 2026-09-04, at the change that corrected what the Solana program
+enforces about branch settlement. The change before it removed the per-branch model-proof
+placeholder.
 
 This page says what the proof layer proves today, which component proves it, and what
 is not proven. It does not describe the target design; for that see `over-summary.md`
@@ -10,21 +12,104 @@ at the repository root.
 
 kswarm has one step that cannot be proven and several that can.
 
-**The LLM step is not proven.** No zero-knowledge proof says a language model produced a
-particular forecast from a particular prompt. That step is secured differently: a
-verifier re-executes the branch with the identical model, seed and configuration, attests
-to its own canonical hash, and challenges a receipt whose hash differs. A worker that
-fabricated a forecast is slashed. This is an economic guarantee, not a cryptographic one,
-and it depends on the model being deterministic enough for two honest runs to agree.
+**The LLM step is not proven, and no 2026 technology proves it.** No zero-knowledge proof
+says a language model produced a particular forecast from a particular prompt. That step
+is secured differently: a verifier re-executes the branch with the identical model, seed
+and configuration, attests to its own canonical hash, and challenges a receipt whose hash
+differs. A worker that fabricated a forecast is slashed. This is an economic guarantee,
+not a cryptographic one, and it rests on determinism that has been measured on exactly
+one model and one prompt family (`llama3.2:3b-instruct-q5_K_M`, the Tier 2 sample in
+[LLM Bridge Honest Limits](llm-bridge-honest-limits.md)). A different model, prompt,
+quantization or host needs its own trials before that guarantee means anything.
 
 **Every deterministic step around it is proven.** The two are complementary, and both run:
 
 | Layer | Where the proof is produced | Where it is checked | What it says | Gated on chain? |
 | --- | --- | --- | --- | --- |
 | Aggregate reduction | Bonsol node running `protocol/bonsol-aggregate-reducer` | Bonsol verifier program, then `settle_aggregate_proof_job` against the marker PDA | The guest read these branch receipts, rehashed each one, decoded the branch values out of those bytes, applied this combiner with these parameters, and got this value over this Merkle root of branch hashes | **Yes** |
-| Branch canonicalization | Branch worker running `protocol/zkvm-reducer` | `worker/verifier_worker` before it attests | The branch output document published to IPFS encodes to exactly the `MFB2` receipt whose hash the chain accepted, and is this many bytes | No. Off-chain, but it gates the attestation, and an aggregate cannot settle without attestations |
+| Branch canonicalization | Branch worker running `protocol/zkvm-reducer` | `worker/verifier_worker` before it attests | The branch output document published to IPFS encodes to exactly the `MFB2` receipt whose hash the chain accepted, and is this many bytes | No, in the strong sense: `settle_job` pays a branch without reading an attestation or a receipt. See "What the chain enforces about a branch" below |
 | LLM inference | -- | `worker/verifier_worker` re-execution, `challenge_job`, slashing | Nothing is proven. A second party ran the same model and got the same canonical hash | No |
-| Branch EZKL proof | `protocol/proofs/ezkl` (research tooling) | Nothing at runtime | A fixed linear model maps the public inputs to the public output | No. Not on the release path |
+
+There is no fourth row. kswarm has no per-branch proof of a model, and the tree carries
+no circuit that stands in for one.
+
+### What The Chain Enforces About A Branch, And What It Does Not
+
+Read the "Gated on chain?" column literally. For a branch job the answer is no in a
+stronger sense than the phrase "off chain" usually carries, and an earlier version of
+this page said the opposite.
+
+`settle_job` requires three things and nothing else: the job is `Completed`, it is not an
+`aggregate-proof` job, and its challenge deadline has passed
+(`solana/programs/kswarm_protocol/src/lib.rs:563-609`). It does not read
+`verifier_attestation_hash`, it does not read a zkVM receipt, and it does not know which
+guest image produced one. Any signer may call it. So a branch that carries no
+canonicalization receipt, or one whose receipt does not verify, is paid at the deadline
+unless an authorized challenge landed inside the window first.
+
+The aggregate path does not repair that for the branch. The aggregate guest is handed the
+`MFB2` receipt **bytes**, rehashes them, decodes the branch values and combines them; it
+is given no branch attestation and no branch zkVM receipt
+(`protocol/bonsol-aggregate-reducer/src/aggregate.rs:238-344`). The verifier's own
+aggregate check compares job class and `submitted_result_hash` and looks at neither a
+branch attestation nor branch settlement status
+(`worker/verifier_worker/daemon.py:456-475`). The aggregator runner does require every
+branch the artifact names to be `settled` -- or `completed` with an attestation under
+`--allow-completed-branches` (`worker/aggregator_runner/runner.py:300-332`) -- but that is
+Python on one operator's host. It is policy, not enforcement, and a branch reaching
+`settled` is by itself no evidence that anyone attested to it.
+
+What is true in the other direction, and is not small:
+
+- The canonicalization receipt **is** verified. The verifier checks it against its pinned
+  image id and binds the journal to this job's rebuilt input frame, to the on-chain
+  `submitted_result_hash` and to the length of the document it fetched, before it will
+  attest (`worker/verifier_worker/daemon.py:283-327`).
+- An attestation that disagrees with the receipt hash makes the receipt challengeable, and
+  the assigned verifier can slash the worker inside the window (`receipt_is_challengeable`
+  at `solana/programs/kswarm_protocol/src/lib.rs:2687`, then `challenge_job`).
+- The aggregate reduction is genuinely gated on chain. `settle_aggregate_proof_job` pays
+  only when the marker's `image_id`, `input_digest`, `output_digest` and `journal_hash`
+  all match the job and the attestation equals the submitted receipt
+  (`solana/programs/kswarm_protocol/src/lib.rs:2342-2380`).
+
+Stated plainly: **the branch-level guarantee is economic and social, not enforced by the
+chain.** It holds when a verifier is assigned, runs, disagrees, and challenges inside the
+window. It does not hold by construction. The aggregate-level guarantee is the one the
+program itself enforces.
+
+**Open item, for the owner to decide.** Requiring a matching attestation in `settle_job`
+before a branch is paid would close this. It is a protocol change with escrow
+consequences and is recorded here as a recommendation, not as a change: a `Completed`
+branch whose verifier never attests would then have no terminal path at all, because
+`cancel_open_job` accepts only `Open` or `AwaitingArtifact` and `slash_stale_job` accepts
+only `Claimed`, so neither reaches it, and the escrow would lock. Any such change needs a
+branch-side counterpart to `cancel_aggregate_proof_job`. The Phase 1 architecture
+decisions record already carries the same observation, as Q1 work.
+
+### Why the LLM step is not proven
+
+This is a limit of the field in 2026, not a gap in this repository.
+
+- **The largest language model anyone can prove with released code is GPT-2 small, at
+  124M parameters**, and the fastest published figure for it is at a **16-token
+  sequence** -- short enough that it is not a like-for-like result against any useful
+  input length. kswarm's branch model is `llama3.2:3b`, roughly **25 times larger**.
+- **Every prover that can reach even that size is published under a proprietary,
+  evaluation-only licence tied to the vendor's own proving network.** None of them can go
+  into a worker image, and running proofs on a vendor's network would put a trusted third
+  party back into the one layer that exists to remove it.
+- **General-purpose zkVMs are further away, not closer.** A transformer forward pass
+  inside a zkVM costs on the order of a billion cycles per token, and specialized systems
+  are two to three orders of magnitude ahead of them on this workload.
+- **Even a proof would have to publish its weights.** A valid proof of inference over
+  *private* weights does not establish that the declared model ran: a prover can declare
+  an architecture and parameter count and still embed structured weights that collapse
+  the real computation (Hollow-LLM, IEEE S&P 2026). Any model proof kswarm ever ships
+  will use public weights with their hash committed on chain, and will say so.
+
+None of that changes what the aggregate and canonicalization proofs do. It bounds what a
+reader should conclude from the phrase "zero-knowledge" anywhere near this project.
 
 ### Why the branch canonicalization receipt exists
 
@@ -45,8 +130,10 @@ An aggregate-proof job pays for one claim: *these branch receipts, combined by t
 combiner with these parameters, give this value*. The artifact the guest reads carries
 the branch receipt **bytes**, and `sha256(result_bytes)` is the `submitted_result_hash`
 the program already stores for each branch job. So the Merkle root in the journal is a
-root over hashes that are on chain, and anyone can check that every branch the guest
-reduced is a branch that settled.
+root over hashes that are on chain, and any reader holding the artifact can look up each
+named branch job and check that the guest reduced the receipt that job actually
+submitted. That is a check a reader performs; the program does not perform it, and it
+says nothing about whether those branches were attested.
 
 ### What the deferred binding costs, and what puts it back
 
@@ -56,8 +143,10 @@ branches have settled. That is why `kswarm predict bind-aggregate` exists. The
 consequence is that the combiner, its parameters and the branch set are chosen at a
 moment when every branch result is already visible.
 
-Nothing on chain fixes them. The Solana `Job` account has no parent-run field, so the
-chain knows only that the reduced receipts belong to *some* settled branch-proof jobs.
+Nothing on chain fixes them. The Solana `Job` account has no parent-run field, and
+`settle_aggregate_proof_job` reads no branch job account at all, so the chain does not
+know which branch jobs were reduced -- a reader checking the artifact against the branch
+PDAs does.
 The nonce layout closes part of the gap and not all of it: branches take
 `base .. base+N-1` and the aggregate takes `base+N`, so a reader can derive the branch
 PDAs from the aggregate nonce and the journal's `branch_count` -- but dropping a
@@ -78,13 +167,13 @@ An artifact with no plan CID still reduces: the field is provenance the chain ca
 not a value the guest reads. A run opened before the field existed therefore binds with
 a warning rather than a refusal.
 
-## What Changed In This PR
+## What The Runtime Proof-Checking Work Closed
 
 Before it, the release verification record carried three open items that were all the
 same problem:
 
-- "No runtime proof checking." No running process verified an EZKL proof or a zkVM
-  receipt against a claim.
+- "No runtime proof checking." No running process verified a zkVM receipt against a
+  claim.
 - "The aggregate Bonsol binding is inactive." The reducer the CLI named was the *branch*
   reducer, which rejects an aggregate artifact, so every aggregate job was opened UNBOUND
   and could never settle.
@@ -94,6 +183,10 @@ same problem:
 All three are closed. The guests recompute, the aggregate job is opened bound, and both
 daemons check proofs at runtime.
 
+The change after that one removed the per-branch model-proof placeholder described under
+"No per-branch model proof" below, and rewrote every claim on this page and in the
+community documents to match what actually runs.
+
 ## The Aggregate Path, End To End
 
 1. `kswarm predict open` opens the branch jobs and **plans** the aggregate job. It does
@@ -101,6 +194,10 @@ daemons check proofs at runtime.
    and both are functions of the branch receipts, which do not exist until the branches
    run. Opening it early is what forced the old UNBOUND path.
 2. Branch workers execute, the verifier re-executes and attests, the branches settle.
+   That is the intended order, not an enforced one: `settle_job` pays a `Completed` branch
+   at its challenge deadline whether or not an attestation arrived (see "What the chain
+   enforces about a branch").
+
 3. `kswarm predict bind-aggregate <parent-run>` reads each branch job's on-chain
    `result_bytes`, builds the MFA3 artifact, reduces it with the Python mirror of the
    guest, pins it, and opens the aggregate job against the framed artifact digest and the
@@ -244,9 +341,11 @@ The two halves of the proof layer are packaged differently, because they need
 different things.
 
 **Branch receipts are proven and verified inside the worker containers.**
-`docker/swarm/Dockerfile` builds the `zkvm-reducer` host in a stage of its own and
-installs it into the `branch-worker` and `verifier-worker` images, along with the id of
-the guest compiled into it. `KSWARM_ZKVM_HOST` and `KSWARM_ZKVM_IMAGE_ID_FILE` point at
+`docker/swarm/Dockerfile` builds the `zkvm-reducer` host in a stage of its own, through
+`scripts/build-zkvm-guest.sh`, and installs it into the `branch-worker` and
+`verifier-worker` images, along with the id of the guest compiled into it.
+`docker/protocol-node/Dockerfile` calls the same script in a stage of its own, so the two
+images carry the same guest. `KSWARM_ZKVM_HOST` and `KSWARM_ZKVM_IMAGE_ID_FILE` point at
 both, so a worker proves and a verifier verifies with no extra configuration, and a
 verifier refuses a receipt from a guest its own image did not build. The
 `aggregator-runner` and `cli` images do not carry the binary: neither proves anything,
@@ -299,19 +398,31 @@ Current values, from real builds on 2026-09-04:
 | Guest | Image id | Where it is pinned |
 | --- | --- | --- |
 | `protocol/bonsol-aggregate-reducer` (`kswarm_bonsol_aggregate_reducer`) | `785b584bc39a38d76e10fd0bb0c75cab62ae582497b577d03e6c1a9659204f4d` | `cli/kswarm_cli/reducer_image.py`, and every aggregate job's `required_software_digest` |
-| `protocol/zkvm-reducer` branch canonicalization guest | `e73c537a5e92827fee6ba32c561c8d354230e94dc7d98214167b12076b9db367` | `protocol/zkvm-reducer/IMAGE_ID`, which `docker/swarm/Dockerfile` asserts the build reproduces and installs into the worker images as the default pin. The host binary verifies against its own built-in id either way; the pin is what makes a verifier refuse a receipt from a guest it did not expect |
+| `protocol/zkvm-reducer` branch canonicalization guest | `e73c537a5e92827fee6ba32c561c8d354230e94dc7d98214167b12076b9db367` | `protocol/zkvm-reducer/IMAGE_ID`, which `scripts/build-zkvm-guest.sh` asserts every build reproduces, and which is installed into the worker images as the default pin. The host binary verifies against its own built-in id either way; the pin is what makes a verifier refuse a receipt from a guest it did not expect |
 | `protocol/bonsol-branch-reducer` (`mirofish_bonsol_branch_reducer`) | `6017b38ca12ad7fbc9b4f9db6005b726e292c5d8dc4022e3130fe6654f66ccfb` | Nothing. Smoke tests read the manifest the builder writes |
 
-Every RISC Zero component is now pinned to an exact version, in both places that build a
-guest:
+Every RISC Zero component is pinned to an exact version, and every version is declared
+once, in `protocol/risc0-toolchain.env`. No Dockerfile repeats one:
+`scripts/install-risc0-toolchain.sh` reads that file and installs exactly those
+components, and `docker/swarm`, `docker/protocol-node` and `docker/bonsol-eval` all call
+it. Four literals in three Dockerfiles is not a pin, it is three pins that agree until
+someone edits one of them.
 
-| Component | Version | Pinned in |
+| Component | Version | Reaches |
 | --- | --- | --- |
-| `rust` (the guest toolchain) | `1.88.0` | `docker/bonsol-eval/Dockerfile`, `docker/swarm/Dockerfile` |
-| `cpp` | `2024.1.5` | both |
-| `r0vm` | `3.0.3` | both |
-| `cargo-risczero` | `3.0.3` | both |
-| `risczero/risc0-guest-builder` | `sha256:3e12f71bacd27527a61dea96fa0e53e468c99aa261d3a1019b593f6dbd943eb3` | `docker/bonsol-eval/Dockerfile`, applied by `protocol/scripts/run-bonsol-builder.sh` |
+| `rust` (the guest toolchain) | `1.88.0` | every guest ELF; `risc0-build` sets `RUSTC` to it |
+| `cpp` | `2024.1.5` | the guest ELF, through `CC` |
+| `r0vm` | `3.0.3` | the id computation and local proving |
+| `cargo-risczero` | `3.0.3` | the Bonsol build path |
+| `risczero/risc0-guest-builder` | `sha256:3e12f71bacd27527a61dea96fa0e53e468c99aa261d3a1019b593f6dbd943eb3` | the Bonsol guest ELFs; applied by `protocol/scripts/run-bonsol-builder.sh`, which reads the digest from the same declaration |
+
+Two things that are *not* on that list, because they were measured not to reach the
+`zkvm-reducer` guest ELF at all: the Rust toolchain the workspace is built with, and
+`CARGO_HOME`. Two things that are not versions but do reach it: the absolute path the
+guest is compiled at, and the `$HOME` of the user compiling it. Both are declared in the
+same file and enforced by `scripts/build-zkvm-guest.sh`, which is why
+`protocol/zkvm-reducer/IMAGE_ID` now reproduces in every image that builds it. The
+measurement is in `protocol/zkvm-reducer/IMAGE_ID.md`.
 
 That last row is the one that actually decides a Bonsol guest ELF. `bonsol build` compiles
 the guest inside `risczero/risc0-guest-builder:r0.1.88.0`, a tag `risc0-build 3.0.3`
@@ -339,7 +450,7 @@ Every crate pins risc0 `=3.0.3`:
 | Crate | risc0 crates | Runs where |
 | --- | --- | --- |
 | `protocol/bonsol-aggregate-reducer` | `risc0-zkvm =3.0.3` | Bonsol node, Bonsol commit `25a590d09cca0404cc48ec028122df4d1a8c651b` |
-| `protocol/zkvm-reducer` | `risc0-zkvm =3.0.3`, `risc0-build =3.0.3` | `docker/protocol-node` image |
+| `protocol/zkvm-reducer` | `risc0-zkvm =3.0.3`, `risc0-build =3.0.3` | `docker/swarm` and `docker/protocol-node` images, both through `scripts/build-zkvm-guest.sh` |
 | `protocol/bonsol-branch-reducer` | `risc0-zkvm =3.0.3` | Bonsol node (smoke tests only) |
 | `protocol/bonsol-callback-harness` | `risc0-zkvm =3.0.3` (hash impl only) | Bonsol smoke test |
 
@@ -381,15 +492,23 @@ only together with the rzup Rust toolchain.
 
 ### What a verifier does when a receipt does not hold
 
-- **Missing, and required.** The verifier does not attest. The job reaches its challenge
-  deadline with no attestation, so it cannot settle, and the customer cancels it. The
-  worker is paid nothing and is not slashed.
+- **Missing, and required.** The verifier does not attest. Nothing else follows on chain:
+  the job reaches its challenge deadline unattested and `settle_job` pays the worker
+  anyway, because settlement does not read the attestation. There is no branch cancel
+  path. What refusal does buy is evidence -- no verifier put its name to the receipt --
+  and the option to challenge instead, which the paragraph below covers.
 - **Present but wrong, and re-execution also disagrees.** The verifier attests to its own
   re-execution hash. That makes the receipt challengeable and the daemon challenges: the
-  worker is slashed.
+  worker is slashed. This is the only branch case in which the chain moves money against
+  the worker, and it needs the verifier to be the one the customer or admin assigned.
 - **Present but wrong, and re-execution agrees.** The verifier refuses to attest, because
-  attesting would let the job settle on a receipt whose proof does not hold. Same timeout
-  path as "missing".
+  it will not put its name to a receipt whose proof does not hold. Refusing does not stop
+  the job settling; it withholds the attestation and records why. An earlier version of
+  this page said the job then could not settle. That was wrong.
+
+Attesting is the act that arms the challenge path, so a verifier that refuses to attest
+also gives up the only on-chain lever it has over that branch. Whether `settle_job` should
+require a matching attestation before paying is the open item recorded above.
 
 ## Prove Cost
 
@@ -420,20 +539,29 @@ The aggregate proof is produced by the Bonsol node, which also compresses the re
 Groth16 for on-chain verification. That is the expensive half and it runs once per run,
 not once per branch.
 
-## EZKL
+## No Per-Branch Model Proof
 
-`protocol/proofs/ezkl/` stays as research tooling. It is **not** on the release path and
-nothing in the two daemons calls it. Its model is the fixed linear
-`2 * line_count + 3 * word_count + 1`, which is not a submodel of anything kswarm runs, so
-a proof about it says nothing about a kswarm forecast. Its binding rules
-(`binding.py`, `verify_branch.py`) and their tests are correct and are kept, because the
-work to reach a real circuit is mostly the harness around it.
+Until 2026-09-04 this tree carried a halo2/KZG circuit for a per-branch "score". Its
+model was the fixed affine map `2 * line_count + 3 * word_count + 1` over two integers
+read off the output document. It was never a submodel of anything kswarm runs, nothing on
+the release path called it, and a valid proof of it said only that someone had evaluated
+a two-term linear function on two public numbers. It has been taken out of the source
+tree and out of the container image, along with the third-party proving package it needed
+-- a package whose repository ships **no licence file** while its documentation asserts
+that commercial use requires one.
 
-It enters the release path when a real ONNX submodel exists: a model that is actually
-part of branch execution, with proving cost inside a branch's execution window, and a
-verifier that binds its public instances to the branch output the way
-`worker/verifier_worker` binds the zkVM receipt today. Until then this page claims
-nothing for it.
+Nothing replaces it, because nothing can yet. The conditions for a per-branch model proof
+to enter the release path are unchanged and none of them is met:
+
+1. a model that is genuinely part of branch execution, or a scorer whose verdict about a
+   branch document is worth binding to that document;
+2. a prover that can handle it, on a licence that permits shipping it in a worker image;
+3. proving cost inside a branch's execution window; and
+4. a verifier that binds the proof's public values to the branch output the way
+   `worker/verifier_worker` binds the zkVM receipt today.
+
+Condition 2 is the binding one, and it is commercial rather than technical. Until all
+four hold, this page claims no model proof at all.
 
 ## How To Run The Checks
 
@@ -453,9 +581,6 @@ cd protocol/bonsol-callback-harness && cargo test
 
 # Off-chain zkVM host and guest against risc0 3.0.3 (no guest ELF build)
 cd protocol/zkvm-reducer && RISC0_SKIP_BUILD=1 cargo check -p host
-
-# EZKL binding (no ezkl binary needed; integration tests skip without it)
-cd protocol/proofs/ezkl && uv venv .venv && uv pip install -p .venv/bin/python pytest && .venv/bin/python -m pytest -q
 
 # Guest images, and the pin
 protocol/scripts/build-aggregate-reducer.sh --check

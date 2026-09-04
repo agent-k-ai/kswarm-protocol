@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Fail when the git index holds key material.
+# Fail when the git index holds anything that must never be tracked: key material,
+# and build outputs that are not secret but are not sources either -- zero-knowledge
+# proving artefacts and exported models.
 #
 # Usage:
 #   scripts/check-no-secrets.sh              scan the repository that contains this script
@@ -60,6 +62,10 @@ self_test() {
   printf 'x\n' > "${repo}/runtime/protocol/admin.json"
   printf 'x\n' > "${repo}/notes/debug.log"
   printf 'SECRET=1\n' > "${repo}/.env"
+  mkdir -p "${repo}/research/bench"
+  printf 'x\n' > "${repo}/research/bench/circuit.pk"
+  printf 'x\n' > "${repo}/research/bench/kzg.srs"
+  printf 'x\n' > "${repo}/research/bench/model.onnx"
   git -C "${repo}" add -A -f && git -C "${repo}" commit -q -m planted
   local output
   if output="$(scan "${repo}" 2>&1)"; then
@@ -77,14 +83,17 @@ self_test() {
     "content notes/server.txt" \
     "path runtime/protocol/admin.json" \
     "path notes/debug.log" \
-    "path .env"; do
+    "path .env" \
+    "path research/bench/circuit.pk" \
+    "path research/bench/kzg.srs" \
+    "path research/bench/model.onnx"; do
     if ! grep -qF -- "${expected}" <<<"${output}"; then
       echo "self-test FAILED: missing finding '${expected}'" >&2
       echo "${output}" >&2
       return 1
     fi
   done
-  echo "self-test OK: clean repository accepted, $(grep -c . <<<"${output}") findings reported for planted secrets"
+  echo "self-test OK: clean repository accepted, $(grep -c . <<<"${output}") findings reported for planted files"
 }
 
 scan() {
@@ -111,6 +120,18 @@ PATH_GLOBS = (
     "id_rsa*",
     "id_ed25519*",
     "*.log",
+    # Zero-knowledge proving artefacts and exported models. Proving and verifying
+    # keys, structured reference strings and circuit parameters are build outputs;
+    # an ONNX file is the model those artefacts were built for. None of them is a
+    # secret -- an SRS is published so anyone can verify -- but none belongs in the
+    # index either, and `.gitignore` alone does not stop `git add -f` or reach a file
+    # that is already tracked.
+    "*.pk",
+    "*.vk",
+    "*.srs",
+    "*.zkey",
+    "*.params",
+    "*.onnx",
 )
 PATH_PREFIXES = ("runtime/", "solana/deploy/")
 ENV_ALLOWED = {".env.example"}
@@ -212,7 +233,7 @@ if findings:
     for finding in findings:
         print(f"  {finding}", file=sys.stderr)
     sys.exit(1)
-print(f"check-no-secrets: OK, {len(entries)} tracked files, no key material in the index")
+print(f"check-no-secrets: OK, {len(entries)} tracked files, nothing untrackable in the index")
 PY
 }
 
