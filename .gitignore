@@ -1,0 +1,8 @@
+# Build output
+/target/
+/solana/target/
+/test-ledger/
+
+# Editor and OS noise
+.DS_Store
+*.swp

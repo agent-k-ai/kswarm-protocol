@@ -1,0 +1,77 @@
+# Build the program and run the tier-1 integration suite on every push and pull
+# request. The secret gate runs first: nothing builds on a tree that carries key
+# material.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOLANA_VERSION: "2.1.21"
+
+jobs:
+  secrets:
+    name: Key-material gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test the scanner
+        run: scripts/check-no-secrets.sh --self-test
+      - name: Scan the index
+        run: scripts/check-no-secrets.sh
+
+  tier1:
+    name: Build and tier 1
+    needs: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'solana/Cargo.lock') }}
+
+      - name: Install the Solana toolchain
+        run: |
+          set -euo pipefail
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          echo "${HOME}/.local/share/solana/install/active_release/bin" >> "${GITHUB_PATH}"
+
+      - name: Report toolchain versions
+        run: |
+          cargo --version
+          solana --version
+          cargo build-sbf --version
+
+      # `--locked` proves the committed lockfile resolves the program exactly.
+      - name: Build the program
+        run: |
+          cargo build-sbf --tools-version v1.51 \
+            --manifest-path solana/programs/kswarm_protocol/Cargo.toml -- --locked
+
+      - name: Confirm the artifact
+        run: ls -l solana/target/deploy/kswarm_protocol.so
+
+      # Single-threaded: the tests each drive their own in-process validator.
+      - name: Tier 1 integration tests
+        run: cargo test --package anchor_integration --features tier1 -- --test-threads=1

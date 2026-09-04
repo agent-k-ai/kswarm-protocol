@@ -1,0 +1,14 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+kswarm_protocol = "ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM"
+
+[provider]
+cluster = "localnet"
+wallet = "/tmp/kswarm-anchor-wallet.json"
+
+[scripts]
+tier1 = "cargo build-sbf --tools-version v1.51 --manifest-path solana/programs/kswarm_protocol/Cargo.toml -- --locked && cargo test --package anchor_integration --features tier1 -- --test-threads=1"
+tier2 = "cargo test --package anchor_integration --features tier2-bonsol -- --nocapture"
