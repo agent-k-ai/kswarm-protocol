@@ -1,218 +1,462 @@
 # Proof Layer Status
 
-Last verified: 2026-09-03 (PR `fix/proof-binding`, follow-up commits included).
+Last verified: 2026-09-04 (PR `feat/proof-path-python`).
 
-This page says what the proof layer proves today. It does not describe the
-target design. For the target design see `over-summary.md` at the repository root.
+This page says what the proof layer proves today, which component proves it, and what
+is not proven. It does not describe the target design; for that see `over-summary.md`
+at the repository root.
 
-## What Is Proven Today
+## The Trust Split
 
-| Layer | Where it runs | What the proof says | Gated on-chain? |
-| --- | --- | --- | --- |
-| Aggregate settlement | Solana + Bonsol | The Bonsol reducer image ran on the committed input and produced the committed journal. `settle_aggregate_proof_job` pays only when the `BonsolAggregateVerification` marker is `Verified` and the verifier attestation hash equals the worker result hash. | Yes |
-| Branch EZKL proof | Worker (prove); **no runtime verifier** since the Node worker was retired | The fixed linear model `2 * line_count + 3 * word_count + 1` maps the public inputs to the public output. The public instances now must equal the claimed line count, word count, and score. | No. Off-chain only. |
-| Branch zkVM receipt | Worker (prove); **no runtime verifier** since the Node worker was retired | The `zkvm-reducer` guest hashed the values it was given. Every journal field now must equal the claimed result. | No. Off-chain only. |
+kswarm has one step that cannot be proven and several that can.
 
-### The guests commit caller-supplied statistics
+**The LLM step is not proven.** No zero-knowledge proof says a language model produced a
+particular forecast from a particular prompt. That step is secured differently: a
+verifier re-executes the branch with the identical model, seed and configuration, attests
+to its own canonical hash, and challenges a receipt whose hash differs. A worker that
+fabricated a forecast is slashed. This is an economic guarantee, not a cryptographic one,
+and it depends on the model being deterministic enough for two honest runs to agree.
 
-Both zkVM guests take `line_count`, `word_count`, and `score_hex` as inputs.
-They hash those values and commit the hash. They do not read the source text.
-They do not recompute the counts. A proof says "the guest saw these values",
-not "these are the true statistics of the source document".
+**Every deterministic step around it is proven.** The two are complementary, and both run:
 
-The reducer recompute (guest reads the source text and derives the counts) is
-future work. The combiners in `protocol/bonsol-branch-reducer/src/lib.rs`
-(`weighted_mean`, `trimmed_mean`, `majority_vote`, `sorted_branches_merkle_root`)
-are tested but not called by the guest. The worker-trust PR will mirror their
-semantics.
+| Layer | Where the proof is produced | Where it is checked | What it says | Gated on chain? |
+| --- | --- | --- | --- | --- |
+| Aggregate reduction | Bonsol node running `protocol/bonsol-aggregate-reducer` | Bonsol verifier program, then `settle_aggregate_proof_job` against the marker PDA | The guest read these branch receipts, rehashed each one, decoded the branch values out of those bytes, applied this combiner with these parameters, and got this value over this Merkle root of branch hashes | **Yes** |
+| Branch canonicalization | Branch worker running `protocol/zkvm-reducer` | `worker/verifier_worker` before it attests | The branch output document published to IPFS encodes to exactly the `MFB2` receipt whose hash the chain accepted, and is this many bytes | No. Off-chain, but it gates the attestation, and an aggregate cannot settle without attestations |
+| LLM inference | -- | `worker/verifier_worker` re-execution, `challenge_job`, slashing | Nothing is proven. A second party ran the same model and got the same canonical hash | No |
+| Branch EZKL proof | `protocol/proofs/ezkl` (research tooling) | Nothing at runtime | A fixed linear model maps the public inputs to the public output | No. Not on the release path |
 
-## Who Runs These Rules Today
+### Why the branch canonicalization receipt exists
 
-**Nobody, at runtime.** The rules below are implemented and tested, and every one of
-them is exercised by `protocol/test/proof-binding.test.mjs`,
-`protocol/test/bonsol-journal.test.mjs` and `protocol/proofs/ezkl/tests/`, but the
-one component that called them was `protocol/src/proofs.mjs`, reached from the Node
-swarm runner. Both were deleted when the Node worker was retired (PR-8, owner
-decision 2026-09-03), so no running process verifies an EZKL proof or a zkVM receipt
-against a claim.
+Re-execution and the branch receipt catch different lies.
 
-What replaced it is different in kind: the Python verifier
-(`worker/verifier_worker`) re-executes the branch with the identical model, seed and
-configuration and attests to its own canonical hash, and the on-chain program settles
-an aggregate job only against a Bonsol marker. Re-execution catches a fabricated
-result; it does not check a proof. Restoring proof checking means giving
-`proof-binding.mjs` a caller again, or porting it to the Python verifier.
+Re-execution catches a worker that invented a forecast: the verifier runs the model
+itself and gets a different canonical hash. But both sides of that comparison are the
+verifier's own bytes. It cannot catch a worker whose *published document* and *submitted
+receipt* describe different values, because the Solana program stores only
+`sha256(result_bytes)` and never sees the document.
 
-`verify_branch.py` is still a working command-line verifier and still binds a proof
-to its claim; it simply has no daemon calling it.
+The branch receipt closes that: the guest is handed the document and derives the receipt
+from it. A worker cannot publish one document and settle another.
 
-## Binding Rules
+### Why the aggregate proof is the on-chain gate
 
-A proof is accepted only when every rule below holds. Any failure rejects the
-branch output.
+An aggregate-proof job pays for one claim: *these branch receipts, combined by this
+combiner with these parameters, give this value*. The artifact the guest reads carries
+the branch receipt **bytes**, and `sha256(result_bytes)` is the `submitted_result_hash`
+the program already stores for each branch job. So the Merkle root in the journal is a
+root over hashes that are on chain, and anyone can check that every branch the guest
+reduced is a branch that settled.
 
-### EZKL (`protocol/proofs/ezkl/verify_branch.py`, `binding.py`)
+### What the deferred binding costs, and what puts it back
 
-1. `ezkl.verify` passes against the pinned `vk.key`, `settings.json`, `kzg.srs`.
-2. `bundle.proof_sha256` equals the SHA-256 of `proof.json`.
-3. `bundle.vk_sha256` equals the SHA-256 of `vk.key`.
-4. `settings.run_args` has `input_visibility = Public`, `output_visibility = Public`,
-   `param_visibility = Fixed`. Private inputs cannot be bound, so they fail.
-5. `settings.model_instance_shapes` is `[[1, 2], [1, 1]]`. `proof.instances` is
-   one column of exactly 3 elements.
-6. Element 0 equals `quantize(bundle.features.line_count, input_scale)`.
-   Element 1 equals `quantize(bundle.features.word_count, input_scale)`.
-   Element 2 equals `bundle.score_hex` as an exact string.
-7. `bundle.public_instances` equals `proof.instances`.
-8. When the caller passes `--expected-line-count`, `--expected-word-count`, and
-   `--expected-score-hex`, the bound values must equal them. The swarm runner
-   passes the values from the branch output manifest.
+`open_job` fixes `input_bundle_hash` and `expected_result_hash` for good, and both are
+functions of the branch receipts, so the aggregate job cannot be opened until its
+branches have settled. That is why `kswarm predict bind-aggregate` exists. The
+consequence is that the combiner, its parameters and the branch set are chosen at a
+moment when every branch result is already visible.
 
-Encoding (ezkl 23.0.5): each instance element is a BN254 scalar field element,
-64 lowercase hex characters of the little-endian canonical bytes, no `0x`.
-Quantization is `round_half_away_from_zero(value * 2**scale)`.
+Nothing on chain fixes them. The Solana `Job` account has no parent-run field, so the
+chain knows only that the reduced receipts belong to *some* settled branch-proof jobs.
+The nonce layout closes part of the gap and not all of it: branches take
+`base .. base+N-1` and the aggregate takes `base+N`, so a reader can derive the branch
+PDAs from the aggregate nonce and the journal's `branch_count` -- but dropping a
+*prefix* of branches yields exactly the window that derivation produces for the smaller
+count, and the combiner and its parameters are not derivable at all.
 
-### Off-chain zkVM (`protocol/src/proof-binding.mjs`)
+What puts it back is the plan. `predict open` pins `aggregate-plan.json` -- the branch
+jobs, the combiner, its parameters and the reducer image -- to IPFS before any branch
+runs, and the artifact carries that CID. The guest ignores the field, but `input_digest`
+covers the whole artifact and the job's `input_bundle_hash` is fixed at open time, so
+the plan is committed on chain transitively and cannot be swapped afterwards.
+`predict bind-aggregate` refuses a binding whose combiner, parameters, reducer image or
+branch set differ from the plan, and the aggregator runner makes the same comparison
+before it agrees to prove anything -- so the check is made by a second party, not only
+by the customer who chose.
 
-1. `zkvm-reducer verify` passes. The receipt verifies against the verifier
-   binary's own image id.
-2. `manifest.proofs.zkvm.image_id_hex` equals the verifier's `image_id_hex`.
-3. The journal has exactly the fields `branch_key`, `child_job_id`,
-   `line_count`, `parent_request_id`, `reducer_digest`, `score_hex`, `word_count`.
-4. `branch_key`, `child_job_id`, `parent_request_id`, `line_count`, `word_count`
-   equal `manifest.result`.
-5. `score_hex` equals `manifest.proofs.ezkl.score_hex`.
-6. `reducer_digest` equals `sha256(branch_key || child_job_id || parent_request_id || score_hex || le32(line_count) || le32(word_count))`.
-7. `manifest.proofs.zkvm.journal` equals the verified journal on every field.
+An artifact with no plan CID still reduces: the field is provenance the chain carries,
+not a value the guest reads. A run opened before the field existed therefore binds with
+a warning rather than a refusal.
 
-### Manifest (`protocol/src/proof-binding.mjs`)
+## What Changed In This PR
 
-1. `manifest.bundle_version` is `kswarm-branch-output-v1`.
-2. `manifest.branch_key`, `child_job_id`, `parent_request_id` equal `manifest.result`.
-3. `manifest.result.line_count` and `word_count` are integers in `[0, 2^32)`.
-4. The EZKL bundle's `features`, `score_hex`, `proof_sha256`, `vk_sha256` equal the manifest.
-5. The SHA-256 of each fetched artifact equals the hash the manifest names.
+Before it, the release verification record carried three open items that were all the
+same problem:
 
-The worker runs the same checks on its own output before it publishes a
-manifest (`generateSwarmProofBundle`).
+- "No runtime proof checking." No running process verified an EZKL proof or a zkVM
+  receipt against a claim.
+- "The aggregate Bonsol binding is inactive." The reducer the CLI named was the *branch*
+  reducer, which rejects an aggregate artifact, so every aggregate job was opened UNBOUND
+  and could never settle.
+- "The zkVM guests hash what they are given." A proof said "the guest saw these values",
+  not "these are the true statistics of the source".
 
-### Bonsol guest (`protocol/bonsol-branch-reducer`)
+All three are closed. The guests recompute, the aggregate job is opened bound, and both
+daemons check proofs at runtime.
 
-The guest journal is 104 bytes:
+## The Aggregate Path, End To End
+
+1. `kswarm predict open` opens the branch jobs and **plans** the aggregate job. It does
+   not open it. `open_job` fixes `input_bundle_hash` and `expected_result_hash` for good,
+   and both are functions of the branch receipts, which do not exist until the branches
+   run. Opening it early is what forced the old UNBOUND path.
+2. Branch workers execute, the verifier re-executes and attests, the branches settle.
+3. `kswarm predict bind-aggregate <parent-run>` reads each branch job's on-chain
+   `result_bytes`, builds the MFA3 artifact, reduces it with the Python mirror of the
+   guest, pins it, and opens the aggregate job against the framed artifact digest and the
+   predicted journal hash.
+4. `worker/aggregator_runner` fetches the committed artifact, checks its framed digest
+   against `input_bundle_hash`, re-reduces it, checks the journal against
+   `expected_result_hash`, checks every branch receipt in it against that branch job on
+   chain, claims, and submits the guest's committed outputs as the receipt.
+5. The runner then runs `KSWARM_BONSOL_AGGREGATE_COMMAND`
+   (`protocol/scripts/bonsol-aggregate-hook.py`), which funds the marker PDA, deploys the
+   guest image, and asks a Bonsol node to prove the execution. The callback writes a
+   `Verified` marker.
+6. The verifier re-reduces the artifact and attests to the outputs the guest would commit.
+7. `kswarm settle-aggregate` pays, but only when the marker's `image_id`, `input_digest`,
+   `output_digest` and `journal_hash` all match the job and the attestation equals the
+   receipt.
+
+The receipt is submitted **before** the proof is requested, because
+`record_aggregate_verification` requires the job to be `Completed` with
+`submitted_result_hash == output_digest`. If the proof then fails, the job sits
+`Completed` with no marker and `cancel_aggregate_proof_job` refunds the customer after
+the marker timeout, with no slash. **An aggregate that cannot be proven does not settle.**
+
+`KSWARM_ALLOW_UNBOUND_AGGREGATE=1` submits the receipt without requesting a proof. It
+exists for a local stack with no Bonsol node, it warns on every run, and it is refused
+outright on the `devnet` and `mainnet` cluster profiles.
+
+## Journal Layouts
+
+### Aggregate reducer (`protocol/bonsol-aggregate-reducer`), 105 bytes
 
 | Offset | Field | Encoding |
 | --- | --- | --- |
-| 0..32 | `input_digest` | risc0 SHA-256 of the framed public input (`len le64 || json`) |
-| 32..64 | `reducer_digest` | SHA-256 of `"{branch_key}|{child_job_id}|{parent_request_id}|{score_hex}|{line_count}|{word_count}"` |
-| 64..68 | `line_count` | u32 little-endian |
-| 68..72 | `word_count` | u32 little-endian |
-| 72..104 | `score` | the 32 little-endian bytes of `score_hex` |
+| 0..32 | `input_digest` | SHA-256 of the framed public input (`len le64 \|\| artifact`) |
+| 32..33 | `combiner_id` | u8: 1 weighted-mean, 2 trimmed-mean, 3 majority-vote |
+| 33..65 | `combiner_params_digest` | SHA-256 of `kswarm-combiner-params-v1\|combiner_id=N\|trim_bps=N\|category_dictionary_size=N` |
+| 65..69 | `result_value` | u32 little-endian: basis points, or the label index for majority-vote |
+| 69..73 | `branch_count` | u32 little-endian |
+| 73..105 | `merkle_root` | sorted branch-hash Merkle root, RFC 6962 domain separation |
 
-Bonsol forwards bytes 32..104 (72 bytes, the "committed outputs") to the
-callback. The on-chain program stores `output_digest = sha256(committed_outputs)`
-and `journal_hash = sha256(input_digest || committed_outputs)`. It hashes the
-bytes and never parses them, so the hashing rule did not change; only the
-bytes did.
+Bonsol forwards bytes 32..105 (73 bytes, the committed outputs) to the callback. The
+program stores `output_digest = sha256(committed_outputs)` and
+`journal_hash = sha256(input_digest || committed_outputs)`. It hashes the bytes and never
+parses them.
 
-`score_hex` contract: exactly 64 lowercase hex digits, no prefix, the
-little-endian bytes of a BN254 scalar field element, reduced modulo the
-field. This is the encoding EZKL uses for its instances, so the EZKL output
-instance can be passed through unchanged. Byte 0 of the committed score is
-the least significant byte of the score.
+The guest aborts, producing no receipt at all, on: a schema or version it does not know;
+a combiner name that disagrees with its id; a branch whose declared `result_hash` is not
+`sha256(result_bytes)`; a branch whose declared index is not the index inside its
+receipt; branches that are not strictly increasing by index; a zero weight; a non-uniform
+weight under `trimmed-mean` (which averages unweighted, so the weight would be a claim
+the journal does not reflect); a categorical label outside the committed dictionary; a
+scalar combiner over a categorical branch; hex that is not lowercase; and any malformed
+`MFB2` encoding.
 
-- The guest aborts (no receipt) on a missing or malformed `score_hex`. The
-  callback harness returns an error for the same input instead of predicting
-  a journal the guest will never produce.
-- One implementation of the layout: `decode_score_felt`,
-  `reducer_canonical_bytes`, and `committed_outputs` in
-  `protocol/bonsol-branch-reducer/src/lib.rs`, used by the guest and the
-  harness. `binding.py` (`bonsol_committed_outputs`, `bonsol_journal_hash`)
-  and `proof-binding.mjs` (`bonsolCommittedOutputs`, `bonsolJournalHash`)
-  mirror it; `scripts/run-flagship-demo.py` imports the Python one. All four
-  are pinned to the same golden vector
-  (`output_digest = 76a8ed05...c1ea`, `journal_hash = c1bb642e...2363` for the
-  harness default input).
-- Fixed in this PR: the old journal carried one byte taken from the last two
-  hex digits of `score_hex`. EZKL instance strings are little-endian, so that
-  byte was the most significant byte and was `0` for every realistic score.
-  The regression vector `3901...` (313 = 1.22 at scale 8) now commits `0x39`
-  at byte 72; the old decoder committed `0`.
-- The decoder works on bytes. Malformed input (`""`, `"a"`, `"zz"`, `"éa"`,
-  `"deadbeef"`, `"0x..."`) is an error, never a panic.
-- `sorted_branches_merkle_root` uses RFC 6962 style prefixes (`0x00` leaf,
-  `0x01` node) and promotes an odd node unchanged. The old scheme paired the
-  odd node with itself, so `[A, B, B]` and `[A, B, B, B]` gave the same root.
-  Nothing on-chain or in JS computed the old root.
+### Aggregate artifact (`MFA3`)
 
-## RISC Zero Version
+Canonical JSON: sorted keys, no whitespace, UTF-8.
 
-Every crate now pins risc0 `=3.0.3`:
+```json
+{
+  "schema": "MFA3",
+  "schema_version": 3,
+  "parent_run": "<aggregate job pubkey>",
+  "parent_manifest_cid": "<cid>",
+  "output_schema_hash": "<64 lowercase hex>",
+  "combiner": "trimmed-mean",
+  "combiner_id": 2,
+  "combiner_parameters": {"trim_bps": 1000},
+  "branches": [
+    {"branch_index": 0, "job": "<pubkey>", "output_cid": "<cid>",
+     "result_bytes": "<lowercase hex of the MFB2 receipt>",
+     "result_hash": "<64 lowercase hex>", "weight": 1}
+  ]
+}
+```
+
+The guest reads `combiner_id`, `combiner_parameters` and `branches`. Everything else is
+provenance, and it is still covered, because `input_digest` is over the whole framed
+artifact and the job was opened against that digest.
+
+### Branch canonicalization guest (`protocol/zkvm-reducer`), 68 bytes
+
+| Offset | Field | Encoding |
+| --- | --- | --- |
+| 0..32 | `input_digest` | SHA-256 of the framed guest input |
+| 32..64 | `result_hash` | SHA-256 of the recomputed `MFB2` receipt bytes |
+| 64..68 | `output_len` | u32 little-endian, the canonical byte length of the document |
+
+Its input is the `MFBR1` frame:
+
+```json
+{
+  "schema": "MFBR1",
+  "schema_version": 1,
+  "branch_input_sha256": "<64 lowercase hex>",
+  "branch_output": { "...the document, without zkvm_receipt_cid..." }
+}
+```
+
+`zkvm_receipt_cid` is the field on `BranchOutput` that names the receipt. It is excluded
+from the frame and from the canonical hash preimage, because a receipt cannot be inside
+the document it is a proof of. The other two exclusions are unchanged: `narrative_text`
+(ADR Decision 6) and `completed_at_unix` (an honest verifier re-executes later).
+
+### Legacy branch reducer (`protocol/bonsol-branch-reducer`), 104 bytes
+
+Unchanged, and no longer on the aggregate path. Its guest commits the statistics its
+caller supplied. It is kept because `protocol/bonsol-callback-harness` uses it to drive
+the Bonsol callback, marker-PDA and replay smoke tests, and those semantics do not depend
+on which guest ran. `cli/kswarm_cli/bonsol.py` still mirrors its rules for that harness,
+and `cli/tests/test_bonsol_binding.py` still pins the mirror to the harness vectors.
+
+## One Definition Of Every Rule
+
+Every rule the proof layer depends on lives in `protocol/bonsol-aggregate-reducer/src/`:
+the combiners, the Merkle root, the `MFB2` encoding, the canonical JSON rule, and both
+journal layouts. The guest, the host verifier and the tests all call in.
+
+The library shares a package with the guest on purpose. `bonsol build` runs the RISC Zero
+docker build with the **guest directory** as the docker context (`risc0-build`'s
+`DockerOptions::root_dir` defaults to the current directory and the Bonsol CLI chdirs
+into `--zk-program-path` first), so a path dependency outside that directory is simply
+absent from the build. The `zkvm-reducer` guest is a native `risc0-build` build with no
+docker context, so it depends on the same crate by path.
+
+`cli/kswarm_cli/aggregate.py` is the Python mirror. The two are pinned to one set of
+vectors, `cli/tests/vectors/aggregate_journal_vectors.json`, generated from the Rust
+crate: `protocol/bonsol-aggregate-reducer/tests/cross_language_vectors.rs` asserts the
+Rust side and `cli/tests/test_aggregate_artifact.py` asserts the Python side. Neither
+reduction can change without the other failing.
+
+The committed value is computed in **exact integer arithmetic** on both sides:
+round-half-up as `(2*numerator + denominator) / (2*denominator)` in 128-bit integers.
+There is no rounding mode and no floating-point unit for the two languages to agree on.
+The historical `f64` combiners are kept for the reported mean and are pinned against the
+exact ones by property tests.
+
+## Where Proving Runs
+
+The two halves of the proof layer are packaged differently, because they need
+different things.
+
+**Branch receipts are proven and verified inside the worker containers.**
+`docker/swarm/Dockerfile` builds the `zkvm-reducer` host in a stage of its own and
+installs it into the `branch-worker` and `verifier-worker` images, along with the id of
+the guest compiled into it. `KSWARM_ZKVM_HOST` and `KSWARM_ZKVM_IMAGE_ID_FILE` point at
+both, so a worker proves and a verifier verifies with no extra configuration, and a
+verifier refuses a receipt from a guest its own image did not build. The
+`aggregator-runner` and `cli` images do not carry the binary: neither proves anything,
+and it is 150 MB of attack surface.
+
+**The aggregate proof is produced by a Bonsol node, and the aggregator only asks for
+it.** Requesting a Bonsol execution needs the Bonsol CLI, a funded client keypair and a
+docker socket. None of those belong in a hardened worker image, so they live in a
+proving service:
+
+```
+aggregator-runner container                 proving service (operator infrastructure)
+  KSWARM_BONSOL_AGGREGATE_COMMAND=            protocol/scripts/bonsol-hook-server.py
+    python -m aggregator_runner.bonsol_http_hook       |
+  KSWARM_BONSOL_HOOK_URL=http://host:38099/prove  -->  protocol/scripts/bonsol-aggregate-hook.py
+                                                       |
+                                                       Bonsol node, image server, validator
+```
+
+The client forwards the payload and returns the answer and interprets nothing. The
+runner then checks every digest the service returned against its own reduction and
+against the job account, so a proving service that proved a different claim is refused
+by its caller rather than trusted by it. Nothing in that path authenticates the service,
+because nothing needs to: it cannot forge a proof, it can only fail to produce one.
+
+`scripts/swarm-smoke.sh` with `KSWARM_SMOKE_BONSOL=1` composes exactly that: the Bonsol
+stack from `docker-compose.bonsol.yml`, the swarm stack from `docker-compose.swarm.yml`
+pointed at the Bonsol validator, and one host process holding the proving credentials.
+
+## Rebuilding And Re-Pinning A Guest
+
+An image id is a property of the compiled ELF: the guest source, its dependencies, the
+crate name and the RISC Zero toolchain all reach it. Nothing derives it; it is recorded
+from a real build.
+
+```bash
+protocol/scripts/build-aggregate-reducer.sh            # build, print, rewrite the pin
+protocol/scripts/build-aggregate-reducer.sh --check    # build and compare, change nothing
+```
+
+The script runs `bonsol build` inside the pinned `kswarm-bonsol-eval` builder image, the
+same builder `docker-compose.bonsol.yml` uses, copies the manifest to
+`runtime/bonsol/aggregate-reducer-manifest.json`, and rewrites
+`AGGREGATE_REDUCER_IMAGE_ID` in `cli/kswarm_cli/reducer_image.py`. An unset pin fails
+closed: `resolve_aggregate_image_id` refuses rather than opening an aggregate job against
+an image id nobody built.
+
+Current values, from real builds on 2026-09-04:
+
+| Guest | Image id | Where it is pinned |
+| --- | --- | --- |
+| `protocol/bonsol-aggregate-reducer` (`kswarm_bonsol_aggregate_reducer`) | `785b584bc39a38d76e10fd0bb0c75cab62ae582497b577d03e6c1a9659204f4d` | `cli/kswarm_cli/reducer_image.py`, and every aggregate job's `required_software_digest` |
+| `protocol/zkvm-reducer` branch canonicalization guest | `e73c537a5e92827fee6ba32c561c8d354230e94dc7d98214167b12076b9db367` | `protocol/zkvm-reducer/IMAGE_ID`, which `docker/swarm/Dockerfile` asserts the build reproduces and installs into the worker images as the default pin. The host binary verifies against its own built-in id either way; the pin is what makes a verifier refuse a receipt from a guest it did not expect |
+| `protocol/bonsol-branch-reducer` (`mirofish_bonsol_branch_reducer`) | `6017b38ca12ad7fbc9b4f9db6005b726e292c5d8dc4022e3130fe6654f66ccfb` | Nothing. Smoke tests read the manifest the builder writes |
+
+Every RISC Zero component is now pinned to an exact version, in both places that build a
+guest:
+
+| Component | Version | Pinned in |
+| --- | --- | --- |
+| `rust` (the guest toolchain) | `1.88.0` | `docker/bonsol-eval/Dockerfile`, `docker/swarm/Dockerfile` |
+| `cpp` | `2024.1.5` | both |
+| `r0vm` | `3.0.3` | both |
+| `cargo-risczero` | `3.0.3` | both |
+| `risczero/risc0-guest-builder` | `sha256:3e12f71bacd27527a61dea96fa0e53e468c99aa261d3a1019b593f6dbd943eb3` | `docker/bonsol-eval/Dockerfile`, applied by `protocol/scripts/run-bonsol-builder.sh` |
+
+That last row is the one that actually decides a Bonsol guest ELF. `bonsol build` compiles
+the guest inside `risczero/risc0-guest-builder:r0.1.88.0`, a tag `risc0-build 3.0.3`
+hard-codes and upstream can move, so the builder script pulls it by digest, retags it
+locally, and points `risc0-build` at the local tag with `RISC0_DOCKER_CONTAINER_TAG`.
+Pinning `rzup` alone would not have been enough.
+
+Both Bonsol guest ids above were confirmed by rebuilding them against those pins:
+
+```
+guest builder pinned to risczero/risc0-guest-builder@sha256:3e12f71b…43eb3 as :r0.1.88.0-pinned
+Computed image_id: 785b584bc39a38d76e10fd0bb0c75cab62ae582497b577d03e6c1a9659204f4d
+Computed image_id: 6017b38ca12ad7fbc9b4f9db6005b726e292c5d8dc4022e3130fe6654f66ccfb
+```
+
+The branch reducer's id differs from the `a41fa6df…4d39` recorded in the flagship demo
+transcripts, and nothing in that guest's source changed: that id was produced before any
+of this was pinned, when `rzup install` took the newest of everything. The transcripts
+keep the id of the run they describe.
+
+## RISC Zero Version And MSRV
+
+Every crate pins risc0 `=3.0.3`:
 
 | Crate | risc0 crates | Runs where |
 | --- | --- | --- |
-| `protocol/zkvm-reducer` (off-chain branch receipt) | `risc0-zkvm =3.0.3`, `risc0-build =3.0.3` | `docker/protocol-node` image (the binary is built into it) |
-| `protocol/bonsol-branch-reducer` (on-chain aggregate guest) | `risc0-zkvm =3.0.3` | Bonsol node, Bonsol commit `25a590d09cca0404cc48ec028122df4d1a8c651b` |
+| `protocol/bonsol-aggregate-reducer` | `risc0-zkvm =3.0.3` | Bonsol node, Bonsol commit `25a590d09cca0404cc48ec028122df4d1a8c651b` |
+| `protocol/zkvm-reducer` | `risc0-zkvm =3.0.3`, `risc0-build =3.0.3` | `docker/protocol-node` image |
+| `protocol/bonsol-branch-reducer` | `risc0-zkvm =3.0.3` | Bonsol node (smoke tests only) |
 | `protocol/bonsol-callback-harness` | `risc0-zkvm =3.0.3` (hash impl only) | Bonsol smoke test |
 
-Before this PR `protocol/zkvm-reducer` pinned `^5.0.0-rc.1`, a release
-candidate. The two lanes still do not share receipts: an off-chain
-`zkvm-reducer` receipt is verified by the `zkvm-reducer` binary, and the
-on-chain aggregate receipt is verified by the Bonsol verifier program.
+The transitive crates matter twice over.
 
-The transitive risc0 crates matter. `risc0-zkvm 3.0.3` declares caret
-requirements (`risc0-circuit-rv32im ^4.0.2`, `risc0-zkp ^3.0.2`, ...). The
-newer point releases (`risc0-circuit-rv32im 4.0.4`/`4.0.5`, `risc0-zkp
-3.0.4`/`3.0.5`) changed the `SyscallContext` trait, and `risc0-zkvm 3.0.3`
-with the `prove` feature then fails to compile
-(`error[E0038]: the trait risc0_circuit_rv32im::execute::SyscallContext is not dyn compatible`).
-`protocol/zkvm-reducer/Cargo.lock` and `methods/guest/Cargo.lock` therefore
-hold the set from the upstream risc0 v3.0.3 lockfile: `risc0-circuit-*
-4.0.2`, `risc0-circuit-*-sys 4.0.1`, `risc0-zkp`/`binfmt`/`groth16 3.0.2`,
-`risc0-zkos-v1compat 2.2.0`, `risc0-zkvm-platform 2.2.0`. Build with the
-committed lockfiles. Do not `cargo update` these crates on their own.
+**Host side.** `risc0-zkvm 3.0.3` declares caret requirements. The newer point releases
+(`risc0-circuit-rv32im 4.0.4`/`4.0.5`, `risc0-zkp 3.0.4`/`3.0.5`) changed the
+`SyscallContext` trait, and `risc0-zkvm 3.0.3` with the `prove` feature then fails to
+compile. The committed lockfiles hold the set from the upstream risc0 v3.0.3 lockfile.
 
-Verified on a build host (cargo 1.91.1, no rzup toolchain):
-`RISC0_SKIP_BUILD=1 cargo check -p host` finished (25m 19s, first build of
-the risc0 C++ kernels) and `cargo check` of `methods/guest` on the host
-target finished. The guest ELF was not built (needs the rzup toolchain).
+**Guest side.** The RISC Zero guest toolchain for the 3.0.3 line is rustc `1.88.0-dev`.
+`ruint 1.20.0` needs 1.90 and `enum-ordinalize` / `-derive` 4.4.2 need 1.89, and
+`bonsol build` fails outright on either:
 
-Stable risc0 is 3.0.6 (2026-07-17). 3.0.5 carried security backports. A bump
-to 3.0.6 must move the Bonsol prover (the Bonsol node image and its pinned
-risc0) and the on-chain verifier selector together with these crates, so it is
-a separate task. Do not bump one crate alone.
+```
+error: rustc 1.88.0-dev is not supported by the following packages:
+  enum-ordinalize@4.4.2 requires rustc 1.89
+  ruint@1.20.0 requires rustc 1.90
+```
 
-## Rollout Notes
+`protocol/bonsol-aggregate-reducer/Cargo.lock` therefore holds `ruint 1.17.0` and
+`enum-ordinalize` / `-derive 4.3.2`. Build with the committed lockfiles and raise them
+only together with the rzup Rust toolchain.
 
-- `prepare_assets.py` now sets the visibility flags explicitly. Existing
-  EZKL asset directories must be regenerated. The verifier rejects assets
-  with private inputs.
-- The Bonsol guest binary changed twice in this PR (decoder, then journal
-  layout), so its image id changes. Redeploy the reducer image before the
-  next Bonsol smoke test. `protocol/scripts/run-bonsol-smoke-test.sh` and the
-  harness default input now carry a 64-digit `score_hex`.
-- `protocol/bonsol-callback-harness` depends on the reducer crate by path.
-  `cargo build --locked` needs the updated `Cargo.lock` in this PR.
-- `protocol/zkvm-reducer` lockfiles were regenerated for risc0 3.0.3. The
-  guest ELF was not rebuilt here (needs the rzup toolchain). The
-  protocol-node Dockerfile runs `rzup install` with no version, which
-  installs the newest components; the first container build on 3.0.3 must
-  confirm `risc0-build 3.0.3` accepts that toolchain, and pin
-  `rzup install rust <version>` if it does not.
+## Configuration
+
+| Variable | Component | Meaning |
+| --- | --- | --- |
+| `KSWARM_AGGREGATE_IMAGE_ID` | CLI | Override the pinned aggregate reducer image id for one run |
+| `KSWARM_BONSOL_AGGREGATE_COMMAND` | aggregator runner | The Bonsol execution hook. Without it the runner refuses to claim an aggregate job |
+| `KSWARM_BONSOL_HOOK_TIMEOUT_SECONDS` | aggregator runner | Hook timeout, default 1800 |
+| `KSWARM_ALLOW_UNBOUND_AGGREGATE` | aggregator runner | `1` submits an aggregate receipt with no proof. Local clusters only; refused on devnet and mainnet |
+| `KSWARM_ZKVM_HOST` | branch worker, verifier | Path to the `zkvm-reducer` host binary. The `branch-worker` and `verifier-worker` images default it to the binary they carry; unset means this worker proves no receipts and this verifier checks none |
+| `KSWARM_ZKVM_TIMEOUT_SECONDS` | branch worker, verifier | Prove/verify timeout, default 1800 |
+| `KSWARM_ZKVM_IMAGE_ID` | verifier | Pin the branch guest image id a receipt must name |
+| `KSWARM_ZKVM_IMAGE_ID_FILE` | verifier | Where to read that pin when the variable is unset. The images point it at the id they were built with, so a container pins by default |
+| `KSWARM_ZKVM_REQUIRE_RECEIPT` | verifier | `1` refuses to attest to a branch that carries no receipt. The swarm compose defaults it to `1`, because every worker in that stack proves |
+| `KSWARM_BONSOL_HOOK_URL` | aggregator runner | The proving service `aggregator_runner.bonsol_http_hook` calls. See "Where proving runs" |
+
+### What a verifier does when a receipt does not hold
+
+- **Missing, and required.** The verifier does not attest. The job reaches its challenge
+  deadline with no attestation, so it cannot settle, and the customer cancels it. The
+  worker is paid nothing and is not slashed.
+- **Present but wrong, and re-execution also disagrees.** The verifier attests to its own
+  re-execution hash. That makes the receipt challengeable and the daemon challenges: the
+  worker is slashed.
+- **Present but wrong, and re-execution agrees.** The verifier refuses to attest, because
+  attesting would let the job settle on a receipt whose proof does not hold. Same timeout
+  path as "missing".
+
+## Prove Cost
+
+Measured on the build host (a 32-core x86-64 machine, CPU proving only, no GPU prover),
+over a real branch of a two-branch run against `llama3.2:3b-instruct-q5_K_M`:
+
+| Step | Input | Time | Output |
+| --- | --- | --- | --- |
+| `zkvm-reducer prove` | 967-byte guest input, 824-byte output document | **31.9 s** | 358 KB receipt bundle |
+| `zkvm-reducer verify` | that bundle | **< 0.1 s** | the 68-byte journal |
+
+Proving is tens of seconds per branch and verification is free, so the cost falls on the
+worker, not the verifier.
+
+A container proves by default: the `branch-worker` and `verifier-worker` images ship the
+host binary and point `KSWARM_ZKVM_HOST` at it, and `docker-compose.swarm.yml` passes
+that default through. Setting `KSWARM_ZKVM_HOST=` explicitly empty turns the proof path
+off and the worker then publishes no receipt. Outside those images the variable is unset,
+so a worker run from a checkout proves nothing until it is pointed at a binary.
+
+The window still has to allow for it. A branch job whose execution window is shorter than
+the prove time would be slashed for a proof it could not finish; the daemon will not start
+an attempt inside `execute_deadline_margin_seconds` (120 by default, against a measured
+31.9 s prove), and `docker-compose.swarm.yml` says so where the window is configured. The
+358 KB bundle is pinned to IPFS next to a 824-byte output.
+
+The aggregate proof is produced by the Bonsol node, which also compresses the receipt to
+Groth16 for on-chain verification. That is the expensive half and it runs once per run,
+not once per branch.
+
+## EZKL
+
+`protocol/proofs/ezkl/` stays as research tooling. It is **not** on the release path and
+nothing in the two daemons calls it. Its model is the fixed linear
+`2 * line_count + 3 * word_count + 1`, which is not a submodel of anything kswarm runs, so
+a proof about it says nothing about a kswarm forecast. Its binding rules
+(`binding.py`, `verify_branch.py`) and their tests are correct and are kept, because the
+work to reach a real circuit is mostly the harness around it.
+
+It enters the release path when a real ONNX submodel exists: a model that is actually
+part of branch execution, with proving cost inside a branch's execution window, and a
+verifier that binds its public instances to the branch output the way
+`worker/verifier_worker` binds the zkVM receipt today. Until then this page claims
+nothing for it.
 
 ## How To Run The Checks
 
 ```bash
-# EZKL binding (no ezkl binary needed; integration tests skip without it)
-cd protocol/proofs/ezkl && uv venv .venv && uv pip install -p .venv/bin/python pytest && .venv/bin/python -m pytest -q
+# Shared rules, both journal layouts, and the cross-language vectors
+cd protocol/bonsol-aggregate-reducer && cargo test
 
-# Manifest and zkVM journal binding
-cd protocol && npm test && for f in src/*.mjs; do node --check "$f"; done
+# The Python mirror against the same vectors
+cd cli && uv run pytest tests/test_aggregate_artifact.py -q
 
-# Reducer combiners, Merkle root, score decoder, journal layout, harness predictor
+# Worker daemons: aggregate binding, receipt verification, binding failures
+cd worker && uv run pytest -q
+
+# Legacy branch reducer and the callback harness
 cd protocol/bonsol-branch-reducer && cargo test
 cd protocol/bonsol-callback-harness && cargo test
 
-# Off-chain zkVM host and guest crates against risc0 3.0.3 (no guest ELF build)
+# Off-chain zkVM host and guest against risc0 3.0.3 (no guest ELF build)
 cd protocol/zkvm-reducer && RISC0_SKIP_BUILD=1 cargo check -p host
-cd protocol/zkvm-reducer/methods/guest && cargo check
+
+# EZKL binding (no ezkl binary needed; integration tests skip without it)
+cd protocol/proofs/ezkl && uv venv .venv && uv pip install -p .venv/bin/python pytest && .venv/bin/python -m pytest -q
+
+# Guest images, and the pin
+protocol/scripts/build-aggregate-reducer.sh --check
 ```

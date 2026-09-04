@@ -117,9 +117,9 @@ impl Tier2Stack {
             .output()
             .expect("start Bonsol compose stack");
         assert_success(output, "docker compose up");
-        wait_for_container_health("kswarm-bonsol-validator", Duration::from_secs(180));
-        wait_for_container_health("kswarm-bonsol-image-server", Duration::from_secs(180));
-        wait_for_container_health("kswarm-bonsol-node", Duration::from_secs(180));
+        for service in ["bonsol-validator", "bonsol-image-server", "bonsol-node"] {
+            wait_for_service_health(&repo_root, &runtime_dir, service, Duration::from_secs(180));
+        }
 
         Self {
             repo_root,
@@ -225,6 +225,7 @@ fn artifacts_present(dir: &Path) -> bool {
         "kswarm_protocol.so",
         "bonsol-callback-harness",
         "reducer-manifest.json",
+        "aggregate-reducer-manifest.json",
         "client-keypair.json",
         "node-keypair.json",
     ]
@@ -258,28 +259,51 @@ fn compose_down(repo_root: &Path, runtime_dir: &Path) {
         .output();
 }
 
-fn wait_for_container_health(container: &str, timeout: Duration) {
+/// Wait on a compose *service*, not a container name.
+///
+/// The compose file declares no `container_name`: a fixed name is global to the daemon,
+/// so two stacks with different project names would still collide on it. The container
+/// is resolved through `docker compose ps -q` each time round the loop, because it does
+/// not exist yet on the first pass.
+fn wait_for_service_health(repo_root: &Path, runtime_dir: &Path, service: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "-f",
-                "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
-                container,
-            ])
+        let listed = compose_command(repo_root, runtime_dir)
+            .args(["ps", "-q", service])
             .output()
-            .unwrap_or_else(|err| panic!("inspect {container}: {err}"));
-        let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if output.status.success() && (status == "healthy" || status == "running") {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("container {container} did not become healthy; last status: {status}");
+            .unwrap_or_else(|err| panic!("compose ps {service}: {err}"));
+        let container = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+        if !container.is_empty() {
+            let status = container_health(&container);
+            if status == "healthy" || status == "running" {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("service {service} did not become healthy; last status: {status}");
+            }
+        } else if Instant::now() >= deadline {
+            panic!("service {service} never produced a container");
         }
         thread::sleep(Duration::from_secs(2));
     }
 }
+
+fn container_health(container: &str) -> String {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}",
+            container,
+        ])
+        .output()
+        .unwrap_or_else(|err| panic!("inspect {container}: {err}"));
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 
 fn assert_success(output: Output, label: &str) -> Value {
     let stdout = String::from_utf8_lossy(&output.stdout);

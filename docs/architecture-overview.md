@@ -34,15 +34,20 @@ sequenceDiagram
   participant Verifier
   participant Program as kswarm_protocol
 
-  Customer->>Program: open aggregate-proof job
+  Customer->>Customer: build the MFA3 artifact from the settled branch receipts
+  Customer->>Program: open aggregate-proof job (input digest + predicted journal hash)
   Worker->>Program: claim job
-  Worker->>Program: submit receipt
-  Worker->>Bonsol: ExecuteV1 reducer image
+  Worker->>Program: submit receipt (the guest's committed outputs)
+  Worker->>Bonsol: ExecuteV1 aggregate reducer image over the committed artifact
   Bonsol->>Program: callback records BonsolAggregateVerification PDA
-  Verifier->>Program: submit matching attestation
+  Verifier->>Program: re-reduce the artifact, submit matching attestation
   Program->>Program: settle_aggregate_proof_job validates marker and attestation
   Program->>Worker: pay KAI reward
 ```
+
+The aggregate job is opened **after** its branches settle, by `kswarm predict bind-aggregate`, not by `predict open`. `open_job` fixes `input_bundle_hash` and `expected_result_hash` for good, and both are functions of the branch receipts, which do not exist until the branches run. Opening it earlier funds a job no Bonsol marker can ever match.
+
+What the aggregate proof asserts is a recomputation, not an echo. The guest reads the artifact's branch receipt bytes, rehashes each one, decodes the branch values out of those bytes, applies the named combiner with its committed parameters, and commits `combiner_id`, a digest of the parameters, the result value, the branch count, and a Merkle root over the branch hashes. Those hashes are the `submitted_result_hash` values the program already stores for the branch jobs, so anyone can check which branches were reduced. Layouts are in [Proof Layer Status](proof-layer-status.md).
 
 The generic `settle_job` instruction rejects `aggregate-proof` jobs. Aggregate payment must pass through `settle_aggregate_proof_job`, which checks the marker PDA, image id, input digest, output digest, journal hash, and verifier attestation.
 
