@@ -19,6 +19,11 @@ declare_id!("ERNzRcYhX6UYboXAAP7vwzbCKsULYu21R4RFNvDD8CkM");
 const MAX_CID_LEN: usize = 96;
 const MAX_RESULT_BYTES: usize = 512;
 const EMPTY_HASH: [u8; 32] = [0u8; 32];
+/// One rung of the verifier-assignment ladder: how long the assigned verifier has to
+/// attest before `reassign_verifier` may clear the slot. The rung measures a verifier's
+/// responsiveness *to a receipt*, so its clock starts at the later of assignment and
+/// receipt submission, not at assignment alone; `submit_receipt` restamps
+/// `assigned_verifier_unix` for exactly that reason.
 pub const ATTESTATION_WINDOW_SECONDS: i64 = 7200;
 /// Grace period after an aggregate-proof job's challenge window closes. If the job is
 /// still `Completed` when the grace period ends (no Bonsol marker landed, or nobody
@@ -27,6 +32,20 @@ pub const ATTESTATION_WINDOW_SECONDS: i64 = 7200;
 /// the marker PDA is keyed by an off-chain execution id; the grace period is the rule.
 pub const AGGREGATE_MARKER_TIMEOUT_SECONDS: i64 = 86_400;
 pub const MAX_REASSIGNMENTS: u8 = 3;
+/// How many `ATTESTATION_WINDOW_SECONDS` rungs a challenge window has to hold for the
+/// whole ladder to be usable: one rung for the initial assignment, one for each of the
+/// `MAX_REASSIGNMENTS` replacements, and one further window as the tail in which a
+/// challenge can still land after the last rung closes. `MAX_REASSIGNMENTS + 2 = 5`.
+///
+/// The multiple comes from the design review that proposed requiring a verifier
+/// attestation before branch settlement: it derives the same figure and proposes
+/// enforcing `challenge_window_seconds >= multiple * attestation_window_seconds` at open,
+/// against a per-job attestation window. **That gate is not adopted here, and this
+/// constant enforces nothing.** It is the reasoning behind the value an operator should
+/// pass as `InitializeProtocolArgs::min_challenge_window_seconds`; the program compares
+/// only against that configured floor, which a local cluster deliberately sets far below
+/// one rung so its jobs finish in seconds.
+pub const CHALLENGE_WINDOW_LADDER_MULTIPLE: u32 = MAX_REASSIGNMENTS as u32 + 2;
 pub const BONSOL_VERIFIER_PROGRAM_ID: Pubkey =
     pubkey!("BoNsHRcyLLNdtnoDf8hiCNZpyehMC4FDMxs6NTxFi3ew");
 pub const AGGREGATE_PROOF_CAPABILITY_HASH: [u8; 32] = [
@@ -66,6 +85,7 @@ pub mod kswarm_protocol {
             ProtocolError::PaymentMintOwnerMismatch
         );
         validate_stake_floors(&args)?;
+        validate_min_challenge_window(&args)?;
         if token_program == spl_token_2022::ID {
             let mint_data = mint_info.try_borrow_data()?;
             validate_token_2022_mint_extensions(&mint_data)?;
@@ -81,6 +101,7 @@ pub mod kswarm_protocol {
         config.tier_two_stake_floor = args.tier_two_stake_floor;
         config.tier_three_stake_floor = args.tier_three_stake_floor;
         config.verifier_stake_floor = args.verifier_stake_floor;
+        config.min_challenge_window_seconds = args.min_challenge_window_seconds;
         Ok(())
     }
 
@@ -167,12 +188,7 @@ pub mod kswarm_protocol {
             matches!(args.required_tier, 1..=3),
             ProtocolError::InvalidStakeTier
         );
-        require!(
-            args.claim_window_seconds > 0
-                && args.execution_window_seconds > 0
-                && args.challenge_window_seconds > 0,
-            ProtocolError::InvalidDeadline
-        );
+        validate_job_windows(&args, ctx.accounts.config.min_challenge_window_seconds)?;
 
         transfer_checked(
             CpiContext::new(
@@ -363,6 +379,19 @@ pub mod kswarm_protocol {
             .checked_add(i64::from(job.challenge_window_seconds))
             .ok_or(ProtocolError::MathOverflow)?;
         job.status = JobStatus::Completed as u8;
+        // Start the attestation clock here, not at assignment. `validate_assign_verifier`
+        // accepts any non-terminal job, so a verifier can be assigned while the job is
+        // still `Open` or `Claimed` -- and there is nothing to attest until this
+        // instruction has run. Stamping at assignment let the whole reassignment ladder
+        // (`MAX_REASSIGNMENTS` rungs of `ATTESTATION_WINDOW_SECONDS`) burn during a long
+        // execution, so a job could arrive at `Completed` unable to replace whichever
+        // verifier it held. Restamping makes the clock the later of assignment and
+        // receipt: a verifier assigned before the receipt gets a full window from here,
+        // and one assigned afterwards keeps the stamp `assign_verifier` wrote, which is
+        // already later. The slot is not cleared; the same verifier keeps the job.
+        if job.assigned_verifier_authority.is_some() {
+            job.assigned_verifier_unix = Some(now);
+        }
         Ok(())
     }
 
@@ -1511,6 +1540,15 @@ pub struct ProtocolConfig {
     pub tier_two_stake_floor: u64,
     pub tier_three_stake_floor: u64,
     pub verifier_stake_floor: u64,
+    /// Smallest `challenge_window_seconds` `open_job` will accept, in seconds. Set once
+    /// at initialization, like the stake floors, because the value that makes
+    /// verification reachable differs by cluster: a local validator runs jobs end to end
+    /// in seconds, while a real deployment needs at least one
+    /// `ATTESTATION_WINDOW_SECONDS` rung plus a tail for the challenge, and
+    /// `CHALLENGE_WINDOW_LADDER_MULTIPLE` rungs for the whole reassignment ladder.
+    /// Without a floor a customer can open a job with a one-second window on which
+    /// attestation and challenge are unreachable by construction.
+    pub min_challenge_window_seconds: u32,
 }
 
 #[account]
@@ -1580,6 +1618,7 @@ pub struct InitializeProtocolArgs {
     pub tier_two_stake_floor: u64,
     pub tier_three_stake_floor: u64,
     pub verifier_stake_floor: u64,
+    pub min_challenge_window_seconds: u32,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -1768,6 +1807,42 @@ fn derive_stake_tier(config: &ProtocolConfig, total_stake: u64) -> u8 {
     } else {
         0
     }
+}
+
+/// `open_job` window validation.
+///
+/// Every window must be non-zero, and the challenge window must reach the configured
+/// floor. The floor is what stops a customer opening a job on which verification cannot
+/// happen: `challenge_deadline` bounds both `submit_verifier_attestation` and
+/// `challenge_job`, so a one-second window disables, at the customer's sole discretion,
+/// the economic protection the branch layer rests on. It is a `ProtocolConfig` value
+/// rather than a constant because the reachable minimum differs by cluster; see
+/// `CHALLENGE_WINDOW_LADDER_MULTIPLE` for the multiple a real deployment should use.
+fn validate_job_windows(
+    args: &OpenJobArgs,
+    min_challenge_window_seconds: u32,
+) -> std::result::Result<(), ProtocolError> {
+    if args.claim_window_seconds == 0
+        || args.execution_window_seconds == 0
+        || args.challenge_window_seconds == 0
+    {
+        return Err(ProtocolError::InvalidDeadline);
+    }
+    if args.challenge_window_seconds < min_challenge_window_seconds {
+        return Err(ProtocolError::ChallengeWindowBelowFloor);
+    }
+    Ok(())
+}
+
+/// The challenge-window floor must itself be non-zero, so that an initialization cannot
+/// silently restore the unbounded behaviour the floor exists to remove.
+fn validate_min_challenge_window(
+    args: &InitializeProtocolArgs,
+) -> std::result::Result<(), ProtocolError> {
+    if args.min_challenge_window_seconds == 0 {
+        return Err(ProtocolError::InvalidChallengeWindowFloor);
+    }
+    Ok(())
 }
 
 fn validate_stake_floors(args: &InitializeProtocolArgs) -> std::result::Result<(), ProtocolError> {
@@ -2404,6 +2479,13 @@ fn validate_assign_verifier(
 }
 
 fn validate_reassign_verifier(job: &Job, now_unix: i64) -> std::result::Result<(), ProtocolError> {
+    // Reassignment is a timeout on the attestation rung, and nothing can be attested
+    // before a receipt exists. Without this guard any signer -- the instruction is
+    // deliberately permissionless -- could exhaust the ladder while the worker was still
+    // executing. It also keeps a terminal job out, which no other check here did.
+    if job.status != JobStatus::Completed as u8 {
+        return Err(ProtocolError::InvalidJobState);
+    }
     if job.verifier_attestation_hash.is_some() {
         return Err(ProtocolError::AttestationAlreadySubmitted);
     }
@@ -2894,6 +2976,10 @@ pub enum ProtocolError {
     ProgramDataMismatch,
     #[msg("admin signer is not the program upgrade authority")]
     AdminNotUpgradeAuthority,
+    #[msg("challenge window is below the protocol's configured minimum")]
+    ChallengeWindowBelowFloor,
+    #[msg("minimum challenge window must be greater than zero")]
+    InvalidChallengeWindowFloor,
 }
 
 #[cfg(test)]
@@ -2908,6 +2994,7 @@ mod tests {
     const TEST_TIER_TWO_FLOOR: u64 = 250_000_000_000;
     const TEST_TIER_THREE_FLOOR: u64 = 1_000_000_000_000;
     const TEST_VERIFIER_FLOOR: u64 = 100_000_000_000;
+    const TEST_MIN_CHALLENGE_WINDOW_SECONDS: u32 = 30;
 
     fn base_floors() -> InitializeProtocolArgs {
         InitializeProtocolArgs {
@@ -2915,6 +3002,7 @@ mod tests {
             tier_two_stake_floor: TEST_TIER_TWO_FLOOR,
             tier_three_stake_floor: TEST_TIER_THREE_FLOOR,
             verifier_stake_floor: TEST_VERIFIER_FLOOR,
+            min_challenge_window_seconds: TEST_MIN_CHALLENGE_WINDOW_SECONDS,
         }
     }
 
@@ -2929,6 +3017,7 @@ mod tests {
             tier_two_stake_floor: TEST_TIER_TWO_FLOOR,
             tier_three_stake_floor: TEST_TIER_THREE_FLOOR,
             verifier_stake_floor: TEST_VERIFIER_FLOOR,
+            min_challenge_window_seconds: TEST_MIN_CHALLENGE_WINDOW_SECONDS,
         }
     }
 
@@ -4329,6 +4418,110 @@ mod tests {
             validate_verifier_attestation(validation),
             ProtocolError::AttestationStakeTooLow,
         );
+    }
+
+    fn base_open_job_args() -> OpenJobArgs {
+        OpenJobArgs {
+            job_nonce: 1,
+            input_bundle_hash: EMPTY_HASH,
+            expected_result_hash: EMPTY_HASH,
+            reward_amount: 25,
+            required_stake: 50,
+            job_class: JobClass::BranchProof as u8,
+            required_role: NodeRole::WorkerProof as u8,
+            required_tier: StakeTier::TierOne as u8,
+            required_capability_class_hash: EMPTY_HASH,
+            required_software_digest: EMPTY_HASH,
+            claim_window_seconds: 60,
+            execution_window_seconds: 60,
+            challenge_window_seconds: TEST_MIN_CHALLENGE_WINDOW_SECONDS,
+            challenge_bond: 50,
+        }
+    }
+
+    #[test]
+    fn test_validate_job_windows_accepts_the_configured_floor() {
+        let args = base_open_job_args();
+        validate_job_windows(&args, TEST_MIN_CHALLENGE_WINDOW_SECONDS).unwrap();
+    }
+
+    #[test]
+    fn test_validate_job_windows_rejects_a_challenge_window_below_the_floor() {
+        let mut args = base_open_job_args();
+        args.challenge_window_seconds = TEST_MIN_CHALLENGE_WINDOW_SECONDS - 1;
+        assert_protocol_error(
+            validate_job_windows(&args, TEST_MIN_CHALLENGE_WINDOW_SECONDS),
+            ProtocolError::ChallengeWindowBelowFloor,
+        );
+        // The one-second window: legal before the floor existed, unattestable by construction.
+        args.challenge_window_seconds = 1;
+        assert_protocol_error(
+            validate_job_windows(&args, TEST_MIN_CHALLENGE_WINDOW_SECONDS),
+            ProtocolError::ChallengeWindowBelowFloor,
+        );
+    }
+
+    #[test]
+    fn test_validate_job_windows_still_rejects_zero_windows() {
+        for mutate in [
+            |args: &mut OpenJobArgs| args.claim_window_seconds = 0,
+            |args: &mut OpenJobArgs| args.execution_window_seconds = 0,
+            |args: &mut OpenJobArgs| args.challenge_window_seconds = 0,
+        ] {
+            let mut args = base_open_job_args();
+            mutate(&mut args);
+            assert_protocol_error(
+                validate_job_windows(&args, 1),
+                ProtocolError::InvalidDeadline,
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_min_challenge_window_rejects_zero() {
+        let mut args = base_floors();
+        args.min_challenge_window_seconds = 0;
+        assert_protocol_error(
+            validate_min_challenge_window(&args),
+            ProtocolError::InvalidChallengeWindowFloor,
+        );
+        args.min_challenge_window_seconds = 1;
+        validate_min_challenge_window(&args).unwrap();
+    }
+
+    #[test]
+    fn test_challenge_window_ladder_multiple_covers_every_rung_and_a_tail() {
+        // One rung per verifier the ladder can hold, plus one window of challenge tail.
+        assert_eq!(
+            CHALLENGE_WINDOW_LADDER_MULTIPLE,
+            u32::from(MAX_REASSIGNMENTS) + 2
+        );
+        assert_eq!(CHALLENGE_WINDOW_LADDER_MULTIPLE, 5);
+    }
+
+    #[test]
+    fn test_reassign_verifier_rejects_a_job_without_a_receipt() {
+        let mut job = base_job();
+        job.verifier_attestation_hash = None;
+        job.assigned_verifier_authority = Some(Pubkey::new_unique());
+        job.assigned_verifier_unix = Some(100);
+        // Assignment is allowed at any non-terminal status, so these are all reachable
+        // states in which the attestation ladder must not run.
+        for status in [
+            JobStatus::AwaitingArtifact,
+            JobStatus::Open,
+            JobStatus::Claimed,
+            JobStatus::Settled,
+            JobStatus::Cancelled,
+        ] {
+            job.status = status as u8;
+            assert_protocol_error(
+                validate_reassign_verifier(&job, 100 + ATTESTATION_WINDOW_SECONDS),
+                ProtocolError::InvalidJobState,
+            );
+        }
+        job.status = JobStatus::Completed as u8;
+        validate_reassign_verifier(&job, 100 + ATTESTATION_WINDOW_SECONDS).unwrap();
     }
 
     #[test]

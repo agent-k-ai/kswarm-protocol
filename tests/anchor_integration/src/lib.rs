@@ -64,12 +64,24 @@ pub const VERIFIER_STAKE_DEPOSIT: u64 = 150_000 * UNIT;
 /// One token below the verifier floor.
 pub const LOW_VERIFIER_STAKE_DEPOSIT: u64 = VERIFIER_STAKE_FLOOR - UNIT;
 
-pub fn default_stake_floors() -> InitializeProtocolArgs {
+/// Challenge-window floor the tier-1 protocol is initialized with, in seconds.
+///
+/// Deliberately tiny, and equal to `JobSpec::default().challenge_window_seconds`, so the
+/// suite keeps running jobs to their challenge deadline in a few simulated seconds. A
+/// devnet or mainnet deployment sets a floor measured in
+/// `kswarm_protocol::ATTESTATION_WINDOW_SECONDS` rungs instead; see
+/// `kswarm_protocol::CHALLENGE_WINDOW_LADDER_MULTIPLE`.
+pub const MIN_CHALLENGE_WINDOW_SECONDS: u32 = 5;
+
+/// The `initialize_protocol` arguments the tier-1 suite uses: the shipped stake floors
+/// and the small local challenge-window floor above.
+pub fn default_protocol_args() -> InitializeProtocolArgs {
     InitializeProtocolArgs {
         tier_one_stake_floor: TIER_ONE_STAKE_FLOOR,
         tier_two_stake_floor: TIER_TWO_STAKE_FLOOR,
         tier_three_stake_floor: TIER_THREE_STAKE_FLOOR,
         verifier_stake_floor: VERIFIER_STAKE_FLOOR,
+        min_challenge_window_seconds: MIN_CHALLENGE_WINDOW_SECONDS,
     }
 }
 
@@ -170,7 +182,7 @@ impl Default for JobSpec {
             required_software_digest: ZERO_HASH,
             claim_window_seconds: 60,
             execution_window_seconds: 60,
-            challenge_window_seconds: 5,
+            challenge_window_seconds: MIN_CHALLENGE_WINDOW_SECONDS,
             challenge_bond: CHALLENGE_BOND,
             customer_funding_amount: REWARD_AMOUNT * 4,
         }
@@ -247,7 +259,7 @@ impl Tier1Context {
     /// Payment mint owned by `kind`, default floors, protocol initialized.
     pub async fn new_with(kind: TokenProgramKind) -> Self {
         let mut env = Self::start(kind).await;
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("initialize protocol");
         env
@@ -1156,6 +1168,13 @@ impl Tier1Context {
 
     pub async fn warp_past_attestation_window(&mut self) {
         self.warp_seconds(ATTESTATION_WINDOW_SECONDS + 2).await;
+    }
+
+    /// Warps forward to `target_unix`. Warping is one-way, so a target already in the
+    /// past leaves the clock alone.
+    pub async fn warp_to_unix(&mut self, target_unix: i64) {
+        let now = self.current_clock().await.unix_timestamp;
+        self.warp_seconds(target_unix.saturating_sub(now)).await;
     }
 
     /// Warps to just past `challenge_deadline + AGGREGATE_MARKER_TIMEOUT_SECONDS`.

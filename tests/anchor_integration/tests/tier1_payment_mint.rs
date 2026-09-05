@@ -84,7 +84,7 @@ fn payment_mint_initialize_rejects_mint_owner_mismatch() {
             .initialize_protocol_with(
                 classic_mint,
                 TokenProgramKind::Token2022.program_id(),
-                default_stake_floors(),
+                default_protocol_args(),
             )
             .await
             .expect_err("classic mint with Token-2022 program must be rejected");
@@ -97,13 +97,13 @@ fn payment_mint_initialize_rejects_mint_owner_mismatch() {
             .initialize_protocol_with(
                 token_2022_mint,
                 TokenProgramKind::Classic.program_id(),
-                default_stake_floors(),
+                default_protocol_args(),
             )
             .await
             .expect_err("Token-2022 mint with classic program must be rejected");
         assert_anchor_error(err, ProtocolError::PaymentMintOwnerMismatch);
 
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("matching mint owner initializes");
         let config = env.read_config().await;
@@ -116,7 +116,7 @@ fn payment_mint_initialize_rejects_mint_owner_mismatch() {
 #[serial]
 fn payment_mint_initialize_rejects_non_monotonic_floors() {
     run_uninitialized_tier1_test(TokenProgramKind::Token2022, |mut env| async move {
-        let mut equal_tiers = default_stake_floors();
+        let mut equal_tiers = default_protocol_args();
         equal_tiers.tier_two_stake_floor = equal_tiers.tier_one_stake_floor;
         let err = env
             .initialize_protocol(equal_tiers)
@@ -124,7 +124,7 @@ fn payment_mint_initialize_rejects_non_monotonic_floors() {
             .expect_err("equal tier floors must be rejected");
         assert_anchor_error(err, ProtocolError::InvalidStakeFloors);
 
-        let mut zero_tier_one = default_stake_floors();
+        let mut zero_tier_one = default_protocol_args();
         zero_tier_one.tier_one_stake_floor = 0;
         let err = env
             .initialize_protocol(zero_tier_one)
@@ -132,7 +132,7 @@ fn payment_mint_initialize_rejects_non_monotonic_floors() {
             .expect_err("zero tier-one floor must be rejected");
         assert_anchor_error(err, ProtocolError::InvalidStakeFloors);
 
-        let mut descending = default_stake_floors();
+        let mut descending = default_protocol_args();
         descending.tier_three_stake_floor = descending.tier_two_stake_floor - 1;
         let err = env
             .initialize_protocol(descending)
@@ -140,7 +140,7 @@ fn payment_mint_initialize_rejects_non_monotonic_floors() {
             .expect_err("descending tier floors must be rejected");
         assert_anchor_error(err, ProtocolError::InvalidStakeFloors);
 
-        let mut zero_verifier = default_stake_floors();
+        let mut zero_verifier = default_protocol_args();
         zero_verifier.verifier_stake_floor = 0;
         let err = env
             .initialize_protocol(zero_verifier)
@@ -148,7 +148,7 @@ fn payment_mint_initialize_rejects_non_monotonic_floors() {
             .expect_err("zero verifier floor must be rejected");
         assert_anchor_error(err, ProtocolError::InvalidVerifierStakeFloor);
 
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("valid floors initialize");
     });
@@ -165,13 +165,13 @@ fn payment_mint_initialize_rejects_transfer_fee_mint() {
             .initialize_protocol_with(
                 fee_mint,
                 TokenProgramKind::Token2022.program_id(),
-                default_stake_floors(),
+                default_protocol_args(),
             )
             .await
             .expect_err("transfer-fee mint must be rejected");
         assert_anchor_error(err, ProtocolError::ForbiddenMintExtension);
 
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("plain Token-2022 mint initializes");
     });
@@ -181,7 +181,7 @@ fn payment_mint_initialize_rejects_transfer_fee_mint() {
 #[serial]
 fn payment_mint_initialize_is_one_shot() {
     run_tier1_test(|mut env| async move {
-        let mut other_floors = default_stake_floors();
+        let mut other_floors = default_protocol_args();
         other_floors.tier_one_stake_floor += UNIT;
         let err = env
             .initialize_protocol(other_floors)
@@ -240,7 +240,7 @@ fn payment_mint_wrong_token_program_rejected() {
 #[serial]
 fn payment_mint_stake_floors_come_from_config() {
     run_uninitialized_tier1_test(TokenProgramKind::Classic, |mut env| async move {
-        let mut floors = default_stake_floors();
+        let mut floors = default_protocol_args();
         floors.tier_one_stake_floor = 10 * UNIT;
         floors.tier_two_stake_floor = 20 * UNIT;
         floors.tier_three_stake_floor = 30 * UNIT;

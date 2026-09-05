@@ -1,6 +1,28 @@
 # Build the program and run the tier-1 integration suite on every push and pull
 # request. The secret gate runs first: nothing builds on a tree that carries key
 # material.
+#
+# Everything this workflow needs is pinned, because a green badge that depends on
+# what `stable` or `latest` happened to mean that morning is not evidence.
+#
+#   runs-on          ubuntu-24.04, not ubuntu-latest. GitHub migrates the -latest
+#                    label between images (Ubuntu 26.04 is already published), and
+#                    that migration would land here unannounced.
+#   actions          pinned to a commit, not to a tag, which a tag can be moved to
+#                    point anywhere.
+#   Rust             pinned. The image happens to ship 1.98.0 today; the version
+#                    below is the one the tier-1 figures were produced with.
+#   Solana           downloaded as the release archive and checked against a
+#                    SHA-256 recorded here, instead of `sh -c "$(curl ...)"`,
+#                    which runs whatever the server returns.
+#   platform tools   likewise. `cargo build-sbf` will fetch them itself, without
+#                    a checksum, and version 2.1.21 panics while looking for them
+#                    when ~/.cache/solana does not exist yet and --tools-version
+#                    names anything but its built-in v1.43
+#                    (sdk/cargo-build-sbf/src/main.rs:146, an unwrap on
+#                    read_dir). A hosted runner is always in that state on the
+#                    first run, which is why every run of this workflow before
+#                    this change died in "Build the program" after one second.
 name: ci
 
 on:
@@ -17,15 +39,36 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  RUST_VERSION: "1.98.0"
   SOLANA_VERSION: "2.1.21"
+  # sha256 of solana-release-x86_64-unknown-linux-gnu.tar.bz2 for the tag above.
+  SOLANA_SHA256: "5da3359e296f1e6c13522b874317cb4cfe33e73301a9dc60b1e1435cc133b397"
+  # The platform tools the `tier1` script in Anchor.toml builds with.
+  PLATFORM_TOOLS_VERSION: "v1.51"
+  # sha256 of platform-tools-linux-x86_64.tar.bz2 for the version above.
+  PLATFORM_TOOLS_SHA256: "0933e05dd964826e8e2db5c58c34ae255e3baf0ce1711568552dca81b5407a6b"
+  # The tier-1 suite is a fixed size. A run that compiled a narrowed suite, or
+  # none, exits 0 all the same, so the count is read back out of the log.
+  TIER1_TEST_COUNT: "73"
+  CARGO_TERM_COLOR: never
+  # A standard hosted runner has 14 GB of disk. Measured on a four-core
+  # ubuntu-24.04 container on 2026-09-04, this job wanted 12.6 GB of it, and
+  # 8.2 GB of that was debug info in the host test build: `target` alone.
+  # Dropping it takes `target` to 2.2 GB and the whole job to 6.6 GB, and costs
+  # symbol names in a backtrace and nothing else. No test here reads one, and
+  # the tier-1 result was the same 65 passed either way.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   secrets:
     name: Key-material gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Self-test the scanner
         run: scripts/check-no-secrets.sh --self-test
       - name: Scan the index
@@ -34,44 +77,111 @@ jobs:
   tier1:
     name: Build and tier 1
     needs: secrets
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    # A cold run compiles the Solana and Anchor dependency graph twice, once for
+    # SBF and once for the host, on four cores.
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Pin the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --no-self-update
+          rustup default "${RUST_VERSION}"
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # The two toolchain archives are 840 MB together, so they are cached beside
+      # the registry. The install steps below skip a download they already have.
+      - name: Cache cargo and the Solana toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'solana/Cargo.lock') }}
+            ~/.cache/solana
+            ~/.local/share/solana
+          key: cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ env.SOLANA_VERSION }}-${{ env.PLATFORM_TOOLS_VERSION }}-${{ hashFiles('Cargo.lock', 'solana/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ env.SOLANA_VERSION }}-${{ env.PLATFORM_TOOLS_VERSION }}-
 
       - name: Install the Solana toolchain
         run: |
           set -euo pipefail
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
-          echo "${HOME}/.local/share/solana/install/active_release/bin" >> "${GITHUB_PATH}"
+          dest="${HOME}/.local/share/solana/install/active_release"
+          if [ ! -x "${dest}/bin/cargo-build-sbf" ]; then
+            archive="${RUNNER_TEMP}/solana-release.tar.bz2"
+            curl --fail --silent --show-error --location --retry 3 --output "${archive}" \
+              "https://github.com/anza-xyz/agave/releases/download/v${SOLANA_VERSION}/solana-release-x86_64-unknown-linux-gnu.tar.bz2"
+            echo "${SOLANA_SHA256}  ${archive}" | sha256sum --check --strict -
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            tar -xjf "${archive}" -C "${dest}" --strip-components=1
+            rm -f "${archive}"
+          fi
+          test -x "${dest}/bin/cargo-build-sbf"
+          echo "${dest}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install the SBF platform tools
+        run: |
+          set -euo pipefail
+          # cargo-build-sbf looks here, and unpacks the archive here itself when
+          # the directory is missing. Doing it here means the bytes are checked.
+          dest="${HOME}/.cache/solana/${PLATFORM_TOOLS_VERSION}/platform-tools"
+          mkdir -p "${HOME}/.cache/solana"
+          if [ ! -d "${dest}/rust" ]; then
+            archive="${RUNNER_TEMP}/platform-tools.tar.bz2"
+            curl --fail --silent --show-error --location --retry 3 --output "${archive}" \
+              "https://github.com/anza-xyz/platform-tools/releases/download/${PLATFORM_TOOLS_VERSION}/platform-tools-linux-x86_64.tar.bz2"
+            echo "${PLATFORM_TOOLS_SHA256}  ${archive}" | sha256sum --check --strict -
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            tar -xjf "${archive}" -C "${dest}"
+            rm -f "${archive}"
+          fi
+          test -x "${dest}/rust/bin/rustc"
 
       - name: Report toolchain versions
         run: |
+          set -euo pipefail
           cargo --version
+          rustc --version
           solana --version
           cargo build-sbf --version
+          # This job is the one that can run out of room; print the headroom.
+          df -h /
 
       # `--locked` proves the committed lockfile resolves the program exactly.
+      #
+      # One download in this step is still unverified and cannot be made
+      # otherwise from here. After the compile, `cargo build-sbf` runs the SDK's
+      # own `sdk/sbf/scripts/strip.sh`, which sources `sdk/sbf/env.sh`, which
+      # runs `sdk/sbf/scripts/install.sh` unconditionally; that script fetches
+      # Criterion and agave's built-in v1.43 platform tools into
+      # `sdk/sbf/dependencies` with no checksum. It runs after the program is
+      # already compiled against the v1.51 tools installed above, so it does not
+      # reach the artifact, and it is what happens on any machine running this
+      # toolchain, including the build host these figures came from. Removing it
+      # would mean patching a vendored shell script.
       - name: Build the program
         run: |
-          cargo build-sbf --tools-version v1.51 \
+          set -euo pipefail
+          cargo build-sbf --tools-version "${PLATFORM_TOOLS_VERSION}" \
             --manifest-path solana/programs/kswarm_protocol/Cargo.toml -- --locked
 
+      # The tier-1 tests load this file into an in-process validator, so a run
+      # that reached the tests without it could not have built anything.
       - name: Confirm the artifact
-        run: ls -l solana/target/deploy/kswarm_protocol.so
+        run: |
+          set -euo pipefail
+          ls -l solana/target/deploy/kswarm_protocol.so
+          sha256sum solana/target/deploy/kswarm_protocol.so
 
       # Single-threaded: the tests each drive their own in-process validator.
       - name: Tier 1 integration tests
-        run: cargo test --package anchor_integration --features tier1 -- --test-threads=1
+        run: |
+          set -euo pipefail
+          cargo test --package anchor_integration --features tier1 -- --test-threads=1 \
+            2>&1 | tee "${RUNNER_TEMP}/tier1.log"
+          scripts/ci/assert-test-count.sh cargo "${TIER1_TEST_COUNT}" "${RUNNER_TEMP}/tier1.log"

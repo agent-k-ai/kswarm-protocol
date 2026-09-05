@@ -57,6 +57,47 @@ kswarm protocol initialize --admin admin --payment-mint <mint> \
   --tier-floors 50000,250000,1000000 --verifier-floor 100000
 ```
 
+## The Challenge-Window Floor Is A Config Value Too
+
+`ProtocolConfig.min_challenge_window_seconds` is the fifth `initialize_protocol`
+argument. It is not a stake floor and not a token amount -- it is seconds -- but it
+follows the same rule and sits here because it is set at the same moment, from the same
+command, and is likewise not a program constant.
+
+`open_job` refuses any job whose `challenge_window_seconds` is below it (error
+`ChallengeWindowBelowFloor`). Before the floor existed, `open_job` validated only
+`challenge_window_seconds > 0`, so a customer could open a job with a one-second window.
+`challenge_deadline` bounds `submit_verifier_attestation` and `challenge_job` alike, so
+such a job cannot be attested or challenged by construction: the customer could disable
+the branch layer's economic protection per job, at its sole discretion.
+
+The unit is one attestation rung, `ATTESTATION_WINDOW_SECONDS` = 7200 s: the time an
+assigned verifier has to attest before `reassign_verifier` may replace it. That clock
+starts when the receipt lands, so a usable window has to hold at least one whole rung,
+plus a tail in which the resulting challenge can still land.
+
+| Cluster | Default | Rungs | Why |
+| --- | ---: | ---: | --- |
+| `local` | 5 s | -- | Not a real bound. The tier-1 suite, `scripts/swarm-smoke.sh` and the demos run whole jobs in seconds; a real floor would make every local run wait hours. |
+| `devnet` | 14,400 s | 2 | One full rung for the assigned verifier plus one full window of challenge tail. Verification is genuinely reachable; the whole reassignment ladder is not guaranteed to fit, which is the price of devnet turnaround. |
+| `mainnet` | 36,000 s | 5 | `MAX_REASSIGNMENTS + 2`: one rung per verifier the ladder can hold (the initial assignment plus three replacements) and one window of tail. |
+
+The mainnet multiple is the one the design review for requiring a verifier attestation
+before branch settlement derives. That review proposes enforcing the multiple inside the
+program, against a per-job attestation window; **that gate is not implemented**. The
+program compares only against the configured floor, and
+`CHALLENGE_WINDOW_LADDER_MULTIPLE` carries the reasoning for whoever chooses the value.
+
+Rules enforced by the program: `min_challenge_window_seconds > 0` at
+`initialize_protocol` (error `InvalidChallengeWindowFloor`), and
+`challenge_window_seconds >= min_challenge_window_seconds` at `open_job`. A cluster whose
+name is none of the three above gets the mainnet value: a floor that is too high fails
+loudly at `open_job`, while one that is too low silently reopens the hole.
+
+```bash
+kswarm --cluster devnet protocol initialize --payment-mint <mint> --min-challenge-window 14400
+```
+
 ## Token Program Pinning
 
 `ProtocolConfig.token_program` stores the program that owns the payment mint. Every instruction that carries a `token_program` account checks it against the config (`has_one = token_program`, error `WrongTokenProgram`). `initialize_protocol` checks that the mint account is owned by the passed token program (error `PaymentMintOwnerMismatch`).
@@ -140,6 +181,7 @@ ProtocolConfig
   tier_two_stake_floor: u64
   tier_three_stake_floor: u64
   verifier_stake_floor: u64
+  min_challenge_window_seconds: u32
 ```
 
-`InitializeProtocolArgs { tier_one_stake_floor, tier_two_stake_floor, tier_three_stake_floor, verifier_stake_floor }`, all `u64` base units.
+`InitializeProtocolArgs { tier_one_stake_floor, tier_two_stake_floor, tier_three_stake_floor, verifier_stake_floor, min_challenge_window_seconds }`: four `u64` base units, then a `u32` of seconds.

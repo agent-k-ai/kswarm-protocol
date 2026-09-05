@@ -18,7 +18,7 @@ const ANCHOR_ACCOUNT_OWNED_BY_WRONG_PROGRAM: u32 = 3007;
 fn initialize_authority_upgrade_authority_becomes_admin() {
     run_uninitialized_tier1_test(TokenProgramKind::Classic, |mut env| async move {
         assert_eq!(env.program_data, program_data_pda());
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("the upgrade authority initializes");
         let config = env.read_config().await;
@@ -35,12 +35,12 @@ fn initialize_authority_rejects_signer_that_is_not_upgrade_authority() {
         let (mint, token_program, program_data) = (env.mint, env.token_program, env.program_data);
 
         let err = env
-            .initialize_protocol_as(&intruder, program_data, mint, token_program, default_stake_floors())
+            .initialize_protocol_as(&intruder, program_data, mint, token_program, default_protocol_args())
             .await
             .expect_err("a signer that is not the upgrade authority must be rejected");
         assert_anchor_error(err, ProtocolError::AdminNotUpgradeAuthority);
 
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("the real upgrade authority still initializes");
         assert_eq!(env.read_config().await.admin, env.upgrade_authority());
@@ -59,12 +59,12 @@ fn initialize_authority_rejects_program_data_that_is_not_the_programs() {
         let (mint, token_program) = (env.mint, env.token_program);
 
         let err = env
-            .initialize_protocol_as(&admin, forged, mint, token_program, default_stake_floors())
+            .initialize_protocol_as(&admin, forged, mint, token_program, default_protocol_args())
             .await
             .expect_err("a ProgramData account that is not the program's must be rejected");
         assert_anchor_error(err, ProtocolError::ProgramDataMismatch);
 
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("the real ProgramData account initializes");
     });
@@ -79,7 +79,7 @@ fn initialize_authority_rejects_account_that_is_not_program_data() {
 
         // The mint is owned by the token program, not the upgradeable loader.
         let err = env
-            .initialize_protocol_as(&admin, mint, mint, token_program, default_stake_floors())
+            .initialize_protocol_as(&admin, mint, mint, token_program, default_protocol_args())
             .await
             .expect_err("a non-ProgramData account must be rejected");
         assert_custom_error_code(err, ANCHOR_ACCOUNT_OWNED_BY_WRONG_PROGRAM);
@@ -92,7 +92,7 @@ fn initialize_authority_rejects_immutable_program() {
     run_uninitialized_tier1_test(TokenProgramKind::Classic, |mut env| async move {
         env.set_upgrade_authority(None);
         let err = env
-            .initialize_protocol(default_stake_floors())
+            .initialize_protocol(default_protocol_args())
             .await
             .expect_err("an immutable program has no upgrade authority");
         assert_anchor_error(err, ProtocolError::AdminNotUpgradeAuthority);
@@ -101,14 +101,14 @@ fn initialize_authority_rejects_immutable_program() {
         let other = Pubkey::new_unique();
         env.set_upgrade_authority(Some(other));
         let err = env
-            .initialize_protocol(default_stake_floors())
+            .initialize_protocol(default_protocol_args())
             .await
             .expect_err("the payer is no longer the upgrade authority");
         assert_anchor_error(err, ProtocolError::AdminNotUpgradeAuthority);
 
         let payer = env.payer();
         env.set_upgrade_authority(Some(payer));
-        env.initialize_protocol(default_stake_floors())
+        env.initialize_protocol(default_protocol_args())
             .await
             .expect("restored upgrade authority initializes");
     });

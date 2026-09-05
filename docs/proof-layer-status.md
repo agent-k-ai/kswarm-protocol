@@ -1,8 +1,8 @@
 # Proof Layer Status
 
-Last verified: 2026-09-04, at the change that corrected what the Solana program
-enforces about branch settlement. The change before it removed the per-branch model-proof
-placeholder.
+Last verified: 2026-09-04, at the change that floored the challenge window and moved the
+attestation clock to the receipt. The change before it corrected what the Solana program
+enforces about branch settlement.
 
 This page says what the proof layer proves today, which component proves it, and what
 is not proven. It does not describe the target design; for that see `over-summary.md`
@@ -77,6 +77,20 @@ Stated plainly: **the branch-level guarantee is economic and social, not enforce
 chain.** It holds when a verifier is assigned, runs, disagrees, and challenges inside the
 window. It does not hold by construction. The aggregate-level guarantee is the one the
 program itself enforces.
+
+Two things about that window are now enforced, and both were previously in the customer's
+gift. The window has a floor: `open_job` refuses a `challenge_window_seconds` below
+`ProtocolConfig.min_challenge_window_seconds`, an `initialize_protocol` argument sized in
+attestation rungs per cluster
+([KAI Payment Token](kai-payment-token.md#the-challenge-window-floor-is-a-config-value-too)),
+so a customer can no longer open a job on which attestation and challenge are unreachable
+by construction. And the attestation clock cannot start before there is a result to
+attest to: `submit_receipt` restamps `assigned_verifier_unix`, so the window an assigned
+verifier gets runs from the later of assignment and receipt, and `reassign_verifier`
+refuses a job that is not `Completed`, so the reassignment ladder can no longer be burned
+during a long execution. Neither changes the paragraph above -- a branch
+still settles unattested -- they only remove two ways of making verification impossible
+before it starts.
 
 **Open item, for the owner to decide.** Requiring a matching attestation in `settle_job`
 before a branch is paid would close this. It is a protocol change with escrow
