@@ -47,9 +47,19 @@ env:
   PLATFORM_TOOLS_VERSION: "v1.51"
   # sha256 of platform-tools-linux-x86_64.tar.bz2 for the version above.
   PLATFORM_TOOLS_SHA256: "0933e05dd964826e8e2db5c58c34ae255e3baf0ce1711568552dca81b5407a6b"
-  # The tier-1 suite is a fixed size. A run that compiled a narrowed suite, or
-  # none, exits 0 all the same, so the count is read back out of the log.
-  TIER1_TEST_COUNT: "73"
+  # Every file in tests/anchor_integration/tests/ is behind a `#![cfg(feature =
+  # ...)]` line, so a run that compiled a narrowed suite, or none at all, exits
+  # 0 the same as a full one. The count is read back out of the log and checked
+  # against this floor, so a green job cannot mean "tested nothing".
+  #
+  # A floor and not an exact size, so that a fix arriving with new tests does not
+  # have to edit this file in the same change to stay green. This is the source
+  # tree's `TIER1_MIN_TESTS` in `scripts/ci/pins.env`, which is what its own
+  # tier-1 script asserts against and which records where the number comes from.
+  # That file is not part of this export and a workflow `env:` block cannot
+  # source one, so the value is copied here; the export's own test suite fails if
+  # the copy and the declaration disagree.
+  TIER1_MIN_TESTS: "73"
   CARGO_TERM_COLOR: never
   # A standard hosted runner has 14 GB of disk. Measured on a four-core
   # ubuntu-24.04 container on 2026-09-04, this job wanted 12.6 GB of it, and
@@ -184,4 +194,4 @@ jobs:
           set -euo pipefail
           cargo test --package anchor_integration --features tier1 -- --test-threads=1 \
             2>&1 | tee "${RUNNER_TEMP}/tier1.log"
-          scripts/ci/assert-test-count.sh cargo "${TIER1_TEST_COUNT}" "${RUNNER_TEMP}/tier1.log"
+          scripts/ci/assert-test-count.sh cargo ">=${TIER1_MIN_TESTS}" "${RUNNER_TEMP}/tier1.log"
